@@ -4,7 +4,9 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context, Result, ensure};
 use chrono::NaiveDate;
 use late_core::db::Db;
-use late_core::models::le_word::{DailyWin, DailyWord, Game, GameParams};
+use late_core::models::le_word::{
+    DailyWin, DailyWord, Game, GameParams, ReplayGame, ReplayGameParams,
+};
 use late_core::models::profile::fetch_username;
 use rand_core::{OsRng, RngCore};
 use tokio::sync::{broadcast, mpsc};
@@ -31,7 +33,8 @@ pub struct LeWordService {
 }
 
 enum GameSaveCommand {
-    Save(GameParams),
+    SaveDaily(GameParams),
+    SaveReplay(ReplayGameParams),
     #[cfg(test)]
     Flush(oneshot::Sender<()>),
 }
@@ -78,9 +81,18 @@ impl LeWordService {
         Ok(word)
     }
 
-    pub async fn load_games(&self, user_id: Uuid) -> Result<Vec<Game>> {
+    pub async fn load_daily_game(
+        &self,
+        user_id: Uuid,
+        puzzle_date: NaiveDate,
+    ) -> Result<Option<Game>> {
         let client = self.db.get().await?;
-        Game::list_by_user_id(&client, user_id).await
+        Game::find_by_user_id_for_date(&client, user_id, puzzle_date).await
+    }
+
+    pub async fn load_replay_game(&self, user_id: Uuid) -> Result<Option<ReplayGame>> {
+        let client = self.db.get().await?;
+        ReplayGame::find_by_user_id(&client, user_id).await
     }
 
     pub fn replay_answer(&self, current_answer: &str, daily_answer: Option<&str>) -> &'static str {
@@ -92,13 +104,23 @@ impl LeWordService {
         DailyWin::has_won_today(&client, user_id, self.today()).await
     }
 
-    pub fn save_game_task(&self, params: GameParams) {
+    pub fn save_daily_game_task(&self, params: GameParams) {
         if self
             .game_save_sender()
-            .send(GameSaveCommand::Save(params))
+            .send(GameSaveCommand::SaveDaily(params))
             .is_err()
         {
-            tracing::error!("failed to enqueue Le Word game state save");
+            tracing::error!("failed to enqueue Le Word daily game state save");
+        }
+    }
+
+    pub fn save_replay_game_task(&self, params: ReplayGameParams) {
+        if self
+            .game_save_sender()
+            .send(GameSaveCommand::SaveReplay(params))
+            .is_err()
+        {
+            tracing::error!("failed to enqueue Le Word replay game state save");
         }
     }
 
@@ -159,7 +181,7 @@ impl LeWordService {
 async fn run_game_save_worker(db: Db, mut save_rx: mpsc::UnboundedReceiver<GameSaveCommand>) {
     while let Some(command) = save_rx.recv().await {
         match command {
-            GameSaveCommand::Save(params) => {
+            GameSaveCommand::SaveDaily(params) => {
                 let result = async {
                     let client = db.get().await?;
                     Game::upsert(&client, params).await?;
@@ -167,7 +189,18 @@ async fn run_game_save_worker(db: Db, mut save_rx: mpsc::UnboundedReceiver<GameS
                 }
                 .await;
                 if let Err(error) = result {
-                    tracing::error!(error = ?error, "failed to save Le Word game state");
+                    tracing::error!(error = ?error, "failed to save Le Word daily game state");
+                }
+            }
+            GameSaveCommand::SaveReplay(params) => {
+                let result = async {
+                    let client = db.get().await?;
+                    ReplayGame::upsert(&client, params).await?;
+                    Result::<()>::Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    tracing::error!(error = ?error, "failed to save Le Word replay game state");
                 }
             }
             #[cfg(test)]

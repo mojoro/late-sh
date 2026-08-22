@@ -21,8 +21,22 @@ crate::user_scoped_model! {
     struct Game {
         @data
         pub user_id: Uuid,
-        pub mode: String,
-        pub puzzle_date: Option<NaiveDate>,
+        pub puzzle_date: NaiveDate,
+        pub answer_word: String,
+        pub guesses: Value,
+        pub current_guess: String,
+        pub is_game_over: bool,
+        pub won: bool,
+    }
+}
+
+crate::user_scoped_model! {
+    table = "le_word_replay_games";
+    user_field = user_id;
+    params = ReplayGameParams;
+    struct ReplayGame {
+        @data
+        pub user_id: Uuid,
         pub answer_word: String,
         pub guesses: Value,
         pub current_guess: String,
@@ -104,8 +118,7 @@ impl Game {
     ) -> Result<Option<Self>> {
         let row = client
             .query_opt(
-                "SELECT * FROM le_word_games
-                 WHERE user_id = $1 AND mode = 'daily' AND puzzle_date = $2",
+                "SELECT * FROM le_word_games WHERE user_id = $1 AND puzzle_date = $2",
                 &[&user_id, &puzzle_date],
             )
             .await?;
@@ -116,21 +129,48 @@ impl Game {
         let row = client
             .query_one(
                 "INSERT INTO le_word_games
-                   (user_id, mode, puzzle_date, answer_word, guesses, current_guess, is_game_over, won)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                 ON CONFLICT (user_id, mode) DO UPDATE SET
-                   puzzle_date = $3,
-                   answer_word = $4,
-                   guesses = $5,
-                   current_guess = $6,
-                   is_game_over = $7,
-                   won = $8,
+                   (user_id, puzzle_date, answer_word, guesses, current_guess, is_game_over, won)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (user_id, puzzle_date) DO UPDATE SET
+                   answer_word = $3,
+                   guesses = $4,
+                   current_guess = $5,
+                   is_game_over = $6,
+                   won = $7,
                    updated = current_timestamp
                  RETURNING *",
                 &[
                     &params.user_id,
-                    &params.mode,
                     &params.puzzle_date,
+                    &params.answer_word,
+                    &params.guesses,
+                    &params.current_guess,
+                    &params.is_game_over,
+                    &params.won,
+                ],
+            )
+            .await?;
+        Ok(Self::from(row))
+    }
+}
+
+impl ReplayGame {
+    pub async fn upsert(client: &Client, params: ReplayGameParams) -> Result<Self> {
+        let row = client
+            .query_one(
+                "INSERT INTO le_word_replay_games
+                   (user_id, answer_word, guesses, current_guess, is_game_over, won)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (user_id) DO UPDATE SET
+                   answer_word = $2,
+                   guesses = $3,
+                   current_guess = $4,
+                   is_game_over = $5,
+                   won = $6,
+                   updated = current_timestamp
+                 RETURNING *",
+                &[
+                    &params.user_id,
                     &params.answer_word,
                     &params.guesses,
                     &params.current_guess,

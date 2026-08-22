@@ -1,5 +1,5 @@
 use crate::{
-    models::le_word::{DailyWin, DailyWord, Game, GameParams},
+    models::le_word::{DailyWin, DailyWord, Game, GameParams, ReplayGame, ReplayGameParams},
     test_utils::{create_test_user, test_db},
 };
 use chrono::NaiveDate;
@@ -40,8 +40,7 @@ async fn game_progress_and_daily_win_persist() {
         &client,
         GameParams {
             user_id: user.id,
-            mode: "daily".to_string(),
-            puzzle_date: Some(today),
+            puzzle_date: today,
             answer_word: "hunch".to_string(),
             guesses: serde_json::json!(["glass", "hunch"]),
             current_guess: String::new(),
@@ -90,8 +89,7 @@ async fn daily_and_replay_progress_use_separate_slots() {
         &client,
         GameParams {
             user_id: user.id,
-            mode: "daily".to_string(),
-            puzzle_date: Some(today),
+            puzzle_date: today,
             answer_word: "hunch".to_string(),
             guesses: serde_json::json!(["glass"]),
             current_guess: String::new(),
@@ -101,12 +99,10 @@ async fn daily_and_replay_progress_use_separate_slots() {
     )
     .await
     .expect("save daily game");
-    Game::upsert(
+    ReplayGame::upsert(
         &client,
-        GameParams {
+        ReplayGameParams {
             user_id: user.id,
-            mode: "replay".to_string(),
-            puzzle_date: None,
             answer_word: "apple".to_string(),
             guesses: serde_json::json!([]),
             current_guess: "sh".to_string(),
@@ -116,12 +112,10 @@ async fn daily_and_replay_progress_use_separate_slots() {
     )
     .await
     .expect("save replay game");
-    Game::upsert(
+    ReplayGame::upsert(
         &client,
-        GameParams {
+        ReplayGameParams {
             user_id: user.id,
-            mode: "replay".to_string(),
-            puzzle_date: None,
             answer_word: "shade".to_string(),
             guesses: serde_json::json!(["apple"]),
             current_guess: String::new(),
@@ -132,14 +126,15 @@ async fn daily_and_replay_progress_use_separate_slots() {
     .await
     .expect("replace replay game");
 
-    let games = Game::list_by_user_id(&client, user.id)
+    let daily = Game::find_by_user_id_for_date(&client, user.id, today)
         .await
-        .expect("load game slots");
-    assert_eq!(games.len(), 2);
-    let daily = games.iter().find(|game| game.mode == "daily").unwrap();
-    let replay = games.iter().find(|game| game.mode == "replay").unwrap();
-    assert_eq!(daily.puzzle_date, Some(today));
+        .expect("load daily game")
+        .expect("saved daily game");
+    let replay = ReplayGame::find_by_user_id(&client, user.id)
+        .await
+        .expect("load replay game")
+        .expect("saved replay game");
+    assert_eq!(daily.puzzle_date, today);
     assert_eq!(daily.answer_word, "hunch");
-    assert_eq!(replay.puzzle_date, None);
     assert_eq!(replay.answer_word, "shade");
 }

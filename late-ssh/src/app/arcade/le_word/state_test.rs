@@ -3,7 +3,7 @@ use crate::app::arcade::le_word::input::{handle_arrow, handle_key};
 use crate::app::arcade::le_word::state::*;
 use crate::app::arcade::le_word::svc::LeWordService;
 use crate::test_helpers::new_test_db;
-use late_core::models::le_word::{DailyWin, DailyWord, Game};
+use late_core::models::le_word::{DailyWin, DailyWord, ReplayGame};
 use late_core::test_utils::create_test_user;
 use tokio::sync::broadcast;
 
@@ -108,7 +108,7 @@ async fn replay_restores_the_in_progress_daily_board() {
         puzzle_date: today,
         answer_word: "hunch".to_string(),
     };
-    let mut state = State::new(user.id, svc, Some(daily_word), Vec::new());
+    let mut state = State::new(user.id, svc, Some(daily_word), None, None);
     state.current_guess = "glass".to_string();
 
     state.show_replay();
@@ -143,20 +143,18 @@ async fn saved_replay_board_is_restored_after_reconnect() {
         puzzle_date: today,
         answer_word: "hunch".to_string(),
     };
-    let replay_game = Game {
+    let replay_game = ReplayGame {
         id: uuid::Uuid::now_v7(),
         created: chrono::Utc::now(),
         updated: chrono::Utc::now(),
         user_id: user.id,
-        mode: "replay".to_string(),
-        puzzle_date: None,
         answer_word: "apple".to_string(),
         guesses: serde_json::json!(["shade"]),
         current_guess: "cl".to_string(),
         is_game_over: false,
         won: false,
     };
-    let mut state = State::new(user.id, svc, Some(daily_word), vec![replay_game]);
+    let mut state = State::new(user.id, svc, Some(daily_word), None, Some(replay_game));
 
     state.show_replay();
 
@@ -180,20 +178,18 @@ async fn saved_replay_rotates_if_its_answer_matches_todays_daily() {
         puzzle_date: today,
         answer_word: "hunch".to_string(),
     };
-    let replay_game = Game {
+    let replay_game = ReplayGame {
         id: uuid::Uuid::now_v7(),
         created: chrono::Utc::now(),
         updated: chrono::Utc::now(),
         user_id: user.id,
-        mode: "replay".to_string(),
-        puzzle_date: None,
         answer_word: "hunch".to_string(),
         guesses: serde_json::json!(["hunch"]),
         current_guess: String::new(),
         is_game_over: true,
         won: true,
     };
-    let mut state = State::new(user.id, svc, Some(daily_word), vec![replay_game]);
+    let mut state = State::new(user.id, svc, Some(daily_word), None, Some(replay_game));
 
     state.show_replay();
 
@@ -217,7 +213,7 @@ async fn random_replay_requires_a_double_press() {
         puzzle_date: today,
         answer_word: "hunch".to_string(),
     };
-    let mut state = State::new(user.id, svc, Some(daily_word), Vec::new());
+    let mut state = State::new(user.id, svc, Some(daily_word), None, None);
 
     assert!(handle_key(&mut state, b'0'));
     assert_eq!(state.mode, Mode::Daily);
@@ -249,7 +245,7 @@ async fn replay_win_does_not_record_a_daily_win() {
         puzzle_date: today,
         answer_word: "hunch".to_string(),
     };
-    let mut state = State::new(user.id, svc, Some(daily_word), Vec::new());
+    let mut state = State::new(user.id, svc, Some(daily_word), None, None);
     state.show_replay();
     state.current_guess = state.answer.clone();
 

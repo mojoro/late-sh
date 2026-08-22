@@ -2,7 +2,7 @@ use super::{
     Coord, MAX_VIEWPORT_COLS, MapCamera, PAN_LIMIT, collisions, derive_bounds, derive_coords,
     dump_level, visible,
 };
-use crate::app::door::lateania::world::seed_world;
+use crate::app::door::lateania::world::{region_atlas_entry, seed_world};
 
 #[test]
 fn every_room_gets_a_coordinate() {
@@ -293,20 +293,244 @@ fn fog_of_war_hides_unvisited_rooms_but_keeps_the_player() {
         "only the player shows under full fog"
     );
 
-    // With everything visited, fog matches the plain viewport everywhere except
-    // the player's own cell, which they always win (see the collision test).
+    // With everything visited, fog alone would match the plain viewport
+    // everywhere except the player's own cell (which they always win, see
+    // the collision test below). The live region filter (`live_filter_
+    // region`) also hides any fully-visited room outside the region the
+    // player is standing in, since this view is centred on the player's own
+    // position - except atlas landmarks (boss/tameable rooms), which stay
+    // exempt from the cut and can therefore win a collided cell the plain
+    // lowest-id view gives to a filtered sibling. So a divergence must be
+    // explained by exactly one of those reasons, never anything else.
     let all: HashSet<_> = world.rooms.keys().copied().collect();
     let lit = super::viewport_explored(&coords, center, cols, rows, &all, world.start_room);
     let plain = super::viewport(&coords, center, cols, rows);
     let (cx, cy) = (cols as usize / 2, rows as usize / 2);
+    let player_region = region_atlas_entry(world.start_room).map(|(name, _)| name);
     assert_eq!(lit[cy][cx], Some(world.start_room));
     for (r, (lit_row, plain_row)) in lit.iter().zip(plain.iter()).enumerate() {
         for (c, (l, p)) in lit_row.iter().zip(plain_row.iter()).enumerate() {
-            if (r, c) != (cy, cx) {
-                assert_eq!(l, p, "cell ({r}, {c}) diverged from the fog-less view");
+            if (r, c) == (cy, cx) || l == p {
+                continue;
             }
+            let plain_region = p.and_then(region_atlas_entry).map(|(name, _)| name);
+            let filtered_out = l.is_none() && p.is_some() && plain_region != player_region;
+            let lit_is_foreign_landmark = l.is_some_and(|id| {
+                super::poi(id).is_some_and(|poi| poi.boss.is_some() || poi.tameable.is_some())
+                    && region_atlas_entry(id).map(|(name, _)| name) != player_region
+            });
+            assert!(
+                filtered_out || lit_is_foreign_landmark,
+                "cell ({r}, {c}) diverged from the fog-less view for a reason other than \
+                 the live region filter: lit={l:?} plain={p:?}"
+            );
         }
     }
+}
+
+#[test]
+fn live_view_hides_a_visited_room_outside_the_players_current_region() {
+    use std::collections::HashSet;
+    // The region filter (`live_filter_region`) only kicks in when the view is
+    // centred on the player's own position - Tony's original complaint was
+    // regions bleeding into the live view around the player, not into a
+    // panned-away review of already-explored history elsewhere (see
+    // `the_camera_pans_and_clamps_to_the_field`, which keeps working exactly
+    // as before). Room 665 is a real, fully-visited room in "The Overworld &
+    // Capitals", a different region than the start room's "Embergate & the
+    // King's Road" - it must vanish from a start-room-centred view even
+    // though nothing else about it is hidden (it's visited, no fog reason to
+    // hide it, and the fog-less `viewport` still shows it).
+    let world = seed_world();
+    let coords = derive_coords(&world);
+    let center = coords[&world.start_room];
+    let (cols, rows) = (21, 11);
+    let all: HashSet<_> = world.rooms.keys().copied().collect();
+
+    assert_eq!(
+        region_atlas_entry(world.start_room).map(|(name, _)| name),
+        Some("Embergate & the King's Road")
+    );
+    assert_eq!(
+        region_atlas_entry(665).map(|(name, _)| name),
+        Some("The Overworld & Capitals")
+    );
+
+    let plain = super::viewport(&coords, center, cols, rows);
+    assert!(
+        plain.iter().flatten().any(|id| *id == Some(665)),
+        "fixture assumption broke: room 665 should be visible in the plain, region-unaware view"
+    );
+    assert!(
+        !super::poi(665).is_some_and(|p| p.boss.is_some() || p.tameable.is_some()),
+        "fixture assumption broke: room 665 must not be an exempt atlas landmark"
+    );
+
+    let lit = super::viewport_explored(&coords, center, cols, rows, &all, world.start_room);
+    assert!(
+        !lit.iter().flatten().any(|id| *id == Some(665)),
+        "a fully-visited room in a different region must not render in a player-centred view"
+    );
+
+    // The same cut on the canvas players actually look at: room 665 sits at
+    // delta (-6, -5) from the start room, well inside a 42x22 screen, and the
+    // live (player-centred) canvas must not draw it.
+    let (scols, srows) = (42, 22);
+    let live = super::map_canvas(
+        &coords,
+        center,
+        scols,
+        srows,
+        &all,
+        world.start_room,
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        !live.iter().flatten().any(|t| *t == super::Tile::Room(665)),
+        "the live canvas must hide a visited room in a foreign region"
+    );
+
+    // Panning the camera away turns the filter off (`live_filter_region`'s
+    // else branch): the same canvas centred on 665 itself is reviewing
+    // explored history, and the foreign room comes back.
+    let panned = super::map_canvas(
+        &coords,
+        coords[&665],
+        scols,
+        srows,
+        &all,
+        world.start_room,
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        panned
+            .iter()
+            .flatten()
+            .any(|t| *t == super::Tile::Room(665)),
+        "a panned canvas keeps drawing foreign regions exactly as before"
+    );
+
+    // And the crosshair inspector agrees with each canvas: the crosshair is
+    // always the view centre (`cursor_room` passes the camera centre as
+    // `at`), so unpanned it names the player's own room, and panned onto 665
+    // it names 665, matching what the panned canvas draws there.
+    assert_eq!(
+        super::room_at(&coords, center, &all, world.start_room),
+        Some(world.start_room)
+    );
+    assert_eq!(
+        super::room_at(&coords, coords[&665], &all, world.start_room),
+        Some(665),
+        "a panned crosshair must resolve the foreign room the panned canvas shows"
+    );
+}
+
+#[test]
+fn a_seam_exit_stubs_instead_of_drawing_a_corridor_into_blank_space() {
+    use std::collections::HashSet;
+    // Room 3 (Embergate & the King's Road) exits North into room 9000
+    // (Hearthward Close), adjacent in the field. Standing in room 3 with both
+    // rooms visited, the live filter hides 9000's cell - so the exit must
+    // render as a `HintKnown` stub ("runs on into something not drawn here"),
+    // not the full corridor styling reserved for a link between two drawn
+    // rooms.
+    let world = seed_world();
+    let coords = derive_coords(&world);
+    assert_eq!(
+        region_atlas_entry(3).map(|(name, _)| name),
+        Some("Embergate & the King's Road")
+    );
+    assert_eq!(
+        region_atlas_entry(9000).map(|(name, _)| name),
+        Some("Hearthward Close")
+    );
+    let c3 = coords[&3];
+    let c9000 = coords[&9000];
+    assert_eq!(
+        (c9000.x - c3.x, c9000.y - c3.y, c9000.z - c3.z),
+        (0, -1, 0),
+        "fixture assumption broke: 9000 should sit directly north of 3"
+    );
+    assert!(
+        !super::poi(9000).is_some_and(|p| p.boss.is_some() || p.tameable.is_some()),
+        "fixture assumption broke: room 9000 must not be an exempt atlas landmark"
+    );
+
+    let visited: HashSet<_> = [3, 9000].into_iter().collect();
+    let (cols, rows) = (21, 11);
+    let canvas = super::map_canvas(
+        &coords,
+        c3,
+        cols,
+        rows,
+        &visited,
+        3,
+        &std::collections::HashSet::new(),
+    );
+    let (cx, cy) = (cols as usize / 2, rows as usize / 2);
+    assert!(
+        !canvas
+            .iter()
+            .flatten()
+            .any(|t| *t == super::Tile::Room(9000)),
+        "the live canvas must hide the visited neighbour in the foreign region"
+    );
+    assert_eq!(
+        canvas[cy - 1][cx],
+        super::Tile::HintKnown('\u{2502}'),
+        "an exit into a filtered region gets an explored-path stub, not a corridor"
+    );
+}
+
+#[test]
+fn a_visited_foreign_boss_stays_drawn_through_the_live_region_filter() {
+    use std::collections::HashSet;
+    // Boss POI 651 lives in "The Overworld & Capitals" at delta (8, -2) from
+    // room 308 in "Embergate & the King's Road": inside a 42x22 screen, so
+    // the arrow pass skips it as "the canvas (or fog) handles it". For that
+    // contract to hold under the live region filter, atlas landmarks
+    // (boss/tameable rooms) must stay exempt from the cut: a visited foreign
+    // boss keeps its cell (and so its marker), it doesn't silently vanish
+    // with the rest of its region.
+    let world = seed_world();
+    let coords = derive_coords(&world);
+    assert!(
+        super::poi(651).is_some_and(|p| p.boss.is_some()),
+        "fixture assumption broke: room 651 should hold a boss"
+    );
+    assert_eq!(
+        region_atlas_entry(651).map(|(name, _)| name),
+        Some("The Overworld & Capitals")
+    );
+    assert_eq!(
+        region_atlas_entry(308).map(|(name, _)| name),
+        Some("Embergate & the King's Road")
+    );
+    let c308 = coords[&308];
+    let c651 = coords[&651];
+    assert_eq!(
+        (c651.x - c308.x, c651.y - c308.y, c651.z - c308.z),
+        (8, -2, 0),
+        "fixture assumption broke: boss 651 should sit at (8, -2) from room 308"
+    );
+
+    let visited: HashSet<_> = [308, 651].into_iter().collect();
+    let canvas = super::map_canvas(
+        &coords,
+        c308,
+        42,
+        22,
+        &visited,
+        308,
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        canvas
+            .iter()
+            .flatten()
+            .any(|t| *t == super::Tile::Room(651)),
+        "a visited boss room must survive the live region filter"
+    );
 }
 
 // ---- collision resolution favours where the player actually stands -------
@@ -620,7 +844,15 @@ fn map_canvas_draws_corridors_between_visited_rooms_and_fogs_the_rest() {
 
     // Everything visited: the centre is the start room, and corridors render.
     let all: HashSet<_> = world.rooms.keys().copied().collect();
-    let canvas = super::map_canvas(&coords, center, cols, rows, &all, start);
+    let canvas = super::map_canvas(
+        &coords,
+        center,
+        cols,
+        rows,
+        &all,
+        start,
+        &std::collections::HashSet::new(),
+    );
     assert!(matches!(canvas[cy][cx], Tile::Room(id) if id == start));
     assert!(
         canvas
@@ -632,7 +864,15 @@ fn map_canvas_draws_corridors_between_visited_rooms_and_fogs_the_rest() {
 
     // Nothing visited: only the player shows, and no corridors leak the layout.
     let empty = HashSet::new();
-    let fogged = super::map_canvas(&coords, center, cols, rows, &empty, start);
+    let fogged = super::map_canvas(
+        &coords,
+        center,
+        cols,
+        rows,
+        &empty,
+        start,
+        &std::collections::HashSet::new(),
+    );
     let visible_rooms: Vec<_> = fogged
         .iter()
         .flatten()
@@ -702,7 +942,15 @@ fn a_discovered_room_ringed_by_fog_shows_exit_hints() {
 
     // Only the anchor is explored - every neighbour is fog.
     let visited: std::collections::HashSet<_> = std::iter::once(anchor).collect();
-    let canvas = super::map_canvas(&coords, coords[&anchor], 21, 21, &visited, anchor);
+    let canvas = super::map_canvas(
+        &coords,
+        coords[&anchor],
+        21,
+        21,
+        &visited,
+        anchor,
+        &std::collections::HashSet::new(),
+    );
 
     let hints = canvas
         .iter()
@@ -765,7 +1013,15 @@ fn a_link_to_an_already_visited_scattered_room_shows_a_known_hint() {
     // actually renders rather than assuming the first candidate always will.
     let renders = candidates.into_iter().any(|(anchor, dest)| {
         let visited: std::collections::HashSet<_> = [anchor, dest].into_iter().collect();
-        let canvas = super::map_canvas(&coords, coords[&anchor], 21, 21, &visited, anchor);
+        let canvas = super::map_canvas(
+            &coords,
+            coords[&anchor],
+            21,
+            21,
+            &visited,
+            anchor,
+            &std::collections::HashSet::new(),
+        );
         canvas
             .iter()
             .flatten()
@@ -824,7 +1080,15 @@ fn a_room_with_a_way_down_shows_a_stair_on_the_map() {
         "the square keeps its Frontier stair down and its city stair up"
     );
     let visited = std::collections::HashSet::from([square]);
-    let canvas = super::map_canvas(coords, coords[&square], 21, 11, &visited, square);
+    let canvas = super::map_canvas(
+        coords,
+        coords[&square],
+        21,
+        11,
+        &visited,
+        square,
+        &std::collections::HashSet::new(),
+    );
     let stairs: Vec<char> = canvas
         .iter()
         .flatten()
@@ -851,7 +1115,15 @@ fn stair_corners_never_collide_with_rooms_corridors_or_each_other() {
     // A dense hand-authored neighbourhood with stairs, houses and roads in it.
     let here = super::world().start_room;
     let visited: std::collections::HashSet<_> = super::world().rooms.keys().copied().collect();
-    let canvas = super::map_canvas(coords, coords[&here], 41, 21, &visited, here);
+    let canvas = super::map_canvas(
+        coords,
+        coords[&here],
+        41,
+        21,
+        &visited,
+        here,
+        &std::collections::HashSet::new(),
+    );
     for (r, row) in canvas.iter().enumerate() {
         for (c, tile) in row.iter().enumerate() {
             // Rooms land on even offsets from the centre cell, corridors on the
@@ -944,7 +1216,15 @@ fn a_scattered_links_stub_follows_the_exit_not_the_coordinate_delta() {
 
     let visited: std::collections::HashSet<_> = w.rooms.keys().copied().collect();
     let (cols, rows) = (11, 7);
-    let canvas = super::map_canvas(coords, coords[&entrance], cols, rows, &visited, entrance);
+    let canvas = super::map_canvas(
+        coords,
+        coords[&entrance],
+        cols,
+        rows,
+        &visited,
+        entrance,
+        &std::collections::HashSet::new(),
+    );
     let (cx, cy) = ((cols / 2) as usize, (rows / 2) as usize);
     assert!(
         matches!(canvas[cy][cx + 1], super::Tile::HintKnown(_)),
@@ -1050,4 +1330,27 @@ fn the_land_graph_is_read_off_the_room_graph_and_covers_every_region() {
     assert_eq!(links["Aelunor, the Faewood"], vec!["Silvael"]);
     assert!(links["Silvael"].contains(&"The Overworld & Capitals"));
     assert!(!links["The Overworld & Capitals"].contains(&"Aelunor, the Faewood"));
+}
+
+#[test]
+fn an_exempt_room_stays_drawn_through_the_live_region_filter() {
+    use std::collections::HashSet;
+    // The overhead map passes the marked destination and active-quest targets
+    // as `exempt`, the live field its occupied rooms: a room the caller
+    // vouches for renders through the live cut (fog permitting), so a
+    // player's own mark or a live foe can't silently vanish with its region.
+    // Room 665 is the same foreign-region fixture the hiding test pins.
+    let world = seed_world();
+    let coords = derive_coords(&world);
+    let center = coords[&world.start_room];
+    let all: HashSet<_> = world.rooms.keys().copied().collect();
+    let exempt: HashSet<_> = [665].into_iter().collect();
+    let canvas = super::map_canvas(&coords, center, 42, 22, &all, world.start_room, &exempt);
+    assert!(
+        canvas
+            .iter()
+            .flatten()
+            .any(|t| *t == super::Tile::Room(665)),
+        "an exempt room must render through the live region filter"
+    );
 }
