@@ -604,7 +604,25 @@ fn draw_field(frame: &mut Frame, area: Rect, view: &PlayerView) {
     let body = rows[1];
     let cols = body.width as i32;
     let height = body.height as i32;
-    let canvas = map_canvas(coords, center, cols, height, &view.visited, player_room);
+    // Colour-coded detail on what's around you. Landmarks (boss/tame) come from
+    // the static atlas; a red dagger marks a room holding a live foe (from the
+    // snapshot's nearby list); a gem marks a harvestable resource room (static).
+    // Resolved before the canvas because occupied rooms bypass the live region
+    // filter: the field never pans, so the filter is always on here, and a
+    // live foe or another adventurer one cell across a region seam must still
+    // show on the primary play screen.
+    let foes: std::collections::HashSet<u32> = view.nearby_foes.iter().copied().collect();
+    let players: std::collections::HashSet<u32> = view.nearby_players.iter().copied().collect();
+    let exempt: std::collections::HashSet<u32> = foes.union(&players).copied().collect();
+    let canvas = map_canvas(
+        coords,
+        center,
+        cols,
+        height,
+        &view.visited,
+        player_room,
+        &exempt,
+    );
 
     // The player token turns hostile-red in a fight, so a glance at the field
     // tells you combat is on even with your eyes off the log.
@@ -687,11 +705,6 @@ fn draw_field(frame: &mut Frame, area: Rect, view: &PlayerView) {
         }
     };
 
-    // Colour-coded detail on what's around you. Landmarks (boss/tame) come from
-    // the static atlas; a red dagger marks a room holding a live foe (from the
-    // snapshot's nearby list); a gem marks a harvestable resource room (static).
-    let foes: std::collections::HashSet<u32> = view.nearby_foes.iter().copied().collect();
-    let players: std::collections::HashSet<u32> = view.nearby_players.iter().copied().collect();
     let foe_style = Style::default()
         .fg(Color::Rgb(235, 90, 80))
         .add_modifier(Modifier::BOLD);
@@ -1483,7 +1496,37 @@ fn draw_world_map(frame: &mut Frame, area: Rect, state: &State, view: &PlayerVie
     let height = body.height as i32;
     let cx = (cols / 2) as usize;
     let cy = (height / 2) as usize;
-    let canvas = map_canvas(coords, center, cols, height, &view.visited, player_room);
+    // The room the player marked, resolved once per frame rather than per cell.
+    let dest_room = state.dest_room();
+    // Active-quest targets, when the overlay is on (`q`). Same-block targets
+    // get a `!` on their cell or a border arrow; cross-block ones are only
+    // counted - across reserved blocks an arrow's direction means nothing.
+    let quest_targets: Vec<super::world::RoomId> = if state.map_quests() {
+        view.quests
+            .iter()
+            .filter(|q| !q.done)
+            .filter_map(|q| q.target)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let quest_cells: std::collections::HashSet<super::world::RoomId> =
+        quest_targets.iter().copied().collect();
+    // The player's own marks bypass the live region filter: the `⚑` and `!`
+    // markers only ever render on a drawn room cell, and `quest_arrows`
+    // treats an in-viewport target as "the canvas draws it", so a filtered
+    // cell would make a mark vanish with no marker, no arrow, and no count.
+    let exempt: std::collections::HashSet<super::world::RoomId> =
+        quest_cells.iter().copied().chain(dest_room).collect();
+    let canvas = map_canvas(
+        coords,
+        center,
+        cols,
+        height,
+        &view.visited,
+        player_room,
+        &exempt,
+    );
 
     let player_style = Style::default()
         .fg(Color::Rgb(250, 240, 140))
@@ -1504,23 +1547,6 @@ fn draw_world_map(frame: &mut Frame, area: Rect, state: &State, view: &PlayerVie
     let quest_style = Style::default()
         .fg(theme::SUCCESS())
         .add_modifier(Modifier::BOLD);
-    // The room the player marked, resolved once per frame rather than per cell.
-    let dest_room = state.dest_room();
-    // Active-quest targets, when the overlay is on (`q`). Same-block targets
-    // get a `!` on their cell or a border arrow; cross-block ones are only
-    // counted - across reserved blocks an arrow's direction means nothing.
-    let quest_targets: Vec<super::world::RoomId> = if state.map_quests() {
-        view.quests
-            .iter()
-            .filter(|q| !q.done)
-            .filter_map(|q| q.target)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let quest_cells: std::collections::HashSet<super::world::RoomId> =
-        quest_targets.iter().copied().collect();
-
     let mut cells: Vec<Vec<(String, Style)>> = canvas
         .iter()
         .map(|row| {

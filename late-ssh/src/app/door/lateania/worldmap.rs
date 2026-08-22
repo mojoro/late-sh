@@ -223,8 +223,11 @@ pub fn visible(
 /// `grid[row][col]` is the room at that screen cell, or `None` for empty space.
 /// Where the spatial field still collides (hand-authored core), the lowest room
 /// id wins so the picture is stable. This is the fog-less view, used by the
-/// dumps and the tests; what players see comes from `viewport_explored`, which
-/// resolves collisions against the player and their explored set instead.
+/// dumps and the tests; what players see comes from `map_canvas` (both the
+/// live field and the overhead map), which resolves collisions against the
+/// player and their explored set instead. `viewport_explored` is that same
+/// fog-and-filter resolution without the corridor pass, kept for the tests
+/// that pin it.
 pub fn viewport(
     coords: &HashMap<RoomId, Coord>,
     center: Coord,
@@ -286,6 +289,67 @@ fn resolve_collision(
     current.min(candidate)
 }
 
+/// The atlas region to hard-filter the view to, or `None` to skip that
+/// filter entirely. Only kicks in when the viewport is actually centred on
+/// the player's own position (`center == coords[player_room]`) - a live,
+/// player-following view. The camera can also pan away to review
+/// already-explored history elsewhere (see `the_camera_pans_and_clamps_to_
+/// the_field`), and "which single region is being viewed" isn't well-defined
+/// at an intentional cross-region collision cell (the Mistfen under
+/// Whisperwood and the like: several *different* regions deliberately share
+/// one coordinate there), so a panned view keeps today's plain
+/// `resolve_collision` behaviour instead of this harder cut - its
+/// player-room and lowest-id tie-breaks already handle that case correctly
+/// on their own.
+fn live_filter_region(
+    coords: &HashMap<RoomId, Coord>,
+    center: Coord,
+    player_room: RoomId,
+    player_region: Option<&'static str>,
+) -> Option<&'static str> {
+    if coords.get(&player_room) == Some(&center) {
+        player_region
+    } else {
+        None
+    }
+}
+
+/// Whether `id` belongs on-screen at all for a viewport whose live-view
+/// region filter resolved to `filter_region` (see `live_filter_region`). An
+/// atlas landmark (a boss or tameable room) always counts, since its marker
+/// is an atlas annotation, not region scenery, and `poi_arrows`/
+/// `quest_arrows` skip anything inside the viewport on the promise that the
+/// canvas (or fog) handles it - filtering a landmark's cell would silently
+/// drop it from the map with no marker, no border arrow, and no count; a
+/// room with no atlas entry (an id outside every `REGIONS` range -
+/// hand-authored connective rooms the atlas simply doesn't list) always
+/// counts as well, so nothing structural goes silently invisible; everything
+/// else only counts if it's in the region actually being viewed. The
+/// player's own room needs no special case: `filter_region` is only ever
+/// `None` or the player's own region, which their room passes by
+/// construction.
+///
+/// This is a harder cut than `resolve_collision`'s same-region *preference*:
+/// that only ever picks a winner for a single contested cell, so two regions
+/// that don't literally collide (adjacent or interleaved in the flat
+/// embedding without sharing a cell) still both rendered at once, reading as
+/// "overlapping" even when every actual collision was already resolved
+/// correctly. Filtering candidates down to one region *before* they ever
+/// reach `resolve_collision` removes that case entirely: a foreign region
+/// never appears on screen while viewing a different one, full stop.
+fn in_viewed_region(id: RoomId, filter_region: Option<&'static str>) -> bool {
+    let Some(region) = filter_region else {
+        return true;
+    };
+    if poi(id).is_some_and(|p| p.boss.is_some() || p.tameable.is_some()) {
+        return true;
+    }
+    match super::world::region_atlas_entry(id) {
+        Some((name, _)) => name == region,
+        None => true,
+    }
+}
+
 /// A viewport with fog of war: cells the player hasn't visited read as empty.
 /// `visited` is the player's explored-room set.
 ///
@@ -304,9 +368,13 @@ pub fn viewport_explored(
     let rx = cols / 2;
     let ry = rows / 2;
     let player_region = super::world::region_atlas_entry(player_room).map(|(name, _)| name);
+    let filter_region = live_filter_region(coords, center, player_room, player_region);
     let mut at: HashMap<(i32, i32), RoomId> = HashMap::new();
     for (id, c) in visible(coords, center, rx + 1, ry + 1) {
         if id != player_room && !visited.contains(&id) {
+            continue;
+        }
+        if !in_viewed_region(id, filter_region) {
             continue;
         }
         at.entry((c.x, c.y))
@@ -539,9 +607,11 @@ pub fn room_at(
     player_room: RoomId,
 ) -> Option<RoomId> {
     let player_region = super::world::region_atlas_entry(player_room).map(|(name, _)| name);
+    let filter_region = live_filter_region(coords, at, player_room, player_region);
     visible(coords, at, 0, 0)
         .into_iter()
         .filter(|(id, _)| *id == player_room || visited.contains(id))
+        .filter(|(id, _)| in_viewed_region(*id, filter_region))
         .map(|(id, _)| id)
         .reduce(|a, b| resolve_collision(a, b, player_room, player_region))
 }
@@ -672,6 +742,13 @@ fn stair_glyph(down: bool, up: bool) -> Option<char> {
 /// room itself as a `Tile::Stair` in that room's corner cell instead. The
 /// player's room wins any cell collision so `@` never vanishes under a stacked
 /// hand-authored room.
+///
+/// `exempt` is the caller's set of rooms that bypass the live region filter
+/// (never the fog): the overhead map passes the marked destination and
+/// active-quest targets so a player's own marks can't vanish behind the cut,
+/// and the live field passes rooms holding live foes or other adventurers so
+/// danger and company stay visible at a region seam. Pass an empty set to
+/// exempt nothing beyond what `in_viewed_region` always keeps.
 pub fn map_canvas(
     coords: &HashMap<RoomId, Coord>,
     center: Coord,
@@ -679,6 +756,7 @@ pub fn map_canvas(
     rows: i32,
     visited: &HashSet<RoomId>,
     player_room: RoomId,
+    exempt: &HashSet<RoomId>,
 ) -> Vec<Vec<Tile>> {
     let (w, h) = (cols.max(0) as usize, rows.max(0) as usize);
     let mut canvas = vec![vec![Tile::Empty; w]; h];
@@ -713,9 +791,14 @@ pub fn map_canvas(
     // is (see `resolve_collision`) instead of whichever happened to be last
     // out of a hash-ordered iterator.
     let player_region = super::world::region_atlas_entry(player_room).map(|(name, _)| name);
+    let filter_region = live_filter_region(coords, center, player_room, player_region);
+    let viewed = |id: RoomId| in_viewed_region(id, filter_region) || exempt.contains(&id);
     let mut winners: HashMap<(i32, i32), RoomId> = HashMap::new();
     for (id, c) in visible(coords, center, rxw, ryw) {
         if c.z != center.z || !seen(id) {
+            continue;
+        }
+        if !viewed(id) {
             continue;
         }
         winners
@@ -762,6 +845,26 @@ pub fn map_canvas(
                 {
                     let stub = if dx != 0 { '\u{2500}' } else { '\u{2502}' };
                     canvas[hy as usize][hx as usize] = Tile::Hint(stub);
+                }
+                continue;
+            }
+            if !viewed(*dest) {
+                // A seen exit into a region this live view doesn't draw. The
+                // full `LinkH`/`LinkV` corridor styling is reserved for a
+                // link between two drawn rooms; a filtered neighbour gets the
+                // explored-jump stub instead (same contract as the
+                // non-adjacent `HintKnown` below: "runs on into somewhere
+                // you've been that isn't drawn here").
+                let Some((dx, dy)) = dir.delta_2d() else {
+                    continue; // up/down: flagged as a Stair, not a stub
+                };
+                let (hx, hy) = (sc + dx, sr + dy);
+                if (0..cols).contains(&hx)
+                    && (0..rows).contains(&hy)
+                    && canvas[hy as usize][hx as usize] == Tile::Empty
+                {
+                    let stub = if dx != 0 { '\u{2500}' } else { '\u{2502}' };
+                    canvas[hy as usize][hx as usize] = Tile::HintKnown(stub);
                 }
                 continue;
             }
