@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use late_core::models::le_word::{DailyWord, Game, GameParams};
+use late_core::models::le_word::{DailyWord, Game, GameParams, ReplayGame, ReplayGameParams};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -24,23 +24,19 @@ pub enum Mode {
     Replay,
 }
 
-impl Mode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Daily => "daily",
-            Self::Replay => "replay",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 struct Snapshot {
-    puzzle_date: Option<NaiveDate>,
     answer: String,
     guesses: Vec<String>,
     current_guess: String,
     is_game_over: bool,
     won: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DailySnapshot {
+    puzzle_date: NaiveDate,
+    board: Snapshot,
 }
 
 pub struct State {
@@ -56,7 +52,7 @@ pub struct State {
     pub show_rules: bool,
     pub reset_pending: bool,
     pub message: String,
-    daily_snapshot: Option<Snapshot>,
+    daily_snapshot: Option<DailySnapshot>,
     replay_snapshot: Option<Snapshot>,
     pub svc: LeWordService,
 }
@@ -66,23 +62,23 @@ impl State {
         user_id: Uuid,
         svc: LeWordService,
         daily_word: Option<DailyWord>,
-        saved_games: Vec<Game>,
+        saved_daily_game: Option<Game>,
+        saved_replay_game: Option<ReplayGame>,
     ) -> Self {
         let daily_snapshot = daily_word.map(|word| {
-            saved_games
-                .iter()
-                .find(|game| {
-                    game.mode == "daily"
-                        && game.puzzle_date == Some(word.puzzle_date)
-                        && game.answer_word == word.answer_word
+            let board = saved_daily_game
+                .as_ref()
+                .filter(|game| {
+                    game.puzzle_date == word.puzzle_date && game.answer_word == word.answer_word
                 })
-                .map(snapshot_from_game)
-                .unwrap_or_else(|| fresh_snapshot(Some(word.puzzle_date), word.answer_word))
+                .map(snapshot_from_daily_game)
+                .unwrap_or_else(|| fresh_snapshot(word.answer_word));
+            DailySnapshot {
+                puzzle_date: word.puzzle_date,
+                board,
+            }
         });
-        let replay_snapshot = saved_games
-            .iter()
-            .find(|game| game.mode == "replay" && game.puzzle_date.is_none())
-            .map(snapshot_from_game);
+        let replay_snapshot = saved_replay_game.as_ref().map(snapshot_from_replay_game);
         let daily_word_loaded = daily_snapshot.is_some();
         let mut state = Self {
             user_id,
@@ -114,9 +110,9 @@ impl State {
             (&self.guesses, self.is_game_over, self.puzzle_date)
         } else if let Some(snapshot) = &self.daily_snapshot {
             (
-                &snapshot.guesses,
-                snapshot.is_game_over,
-                snapshot.puzzle_date,
+                &snapshot.board.guesses,
+                snapshot.board.is_game_over,
+                Some(snapshot.puzzle_date),
             )
         } else {
             return false;
@@ -157,9 +153,9 @@ impl State {
             .replay_snapshot
             .as_ref()
             .zip(self.daily_snapshot.as_ref())
-            .is_some_and(|(replay, daily)| replay.answer == daily.answer);
+            .is_some_and(|(replay, daily)| replay.answer == daily.board.answer);
         if self.replay_snapshot.is_none() || replay_conflicts_with_daily {
-            self.replay_snapshot = Some(fresh_snapshot(None, self.next_replay_answer()));
+            self.replay_snapshot = Some(fresh_snapshot(self.next_replay_answer()));
         }
         self.load_mode_snapshot();
         self.save_async();
@@ -171,9 +167,10 @@ impl State {
             self.store_active_snapshot();
             self.save_async();
         }
-        let snapshot = fresh_snapshot(None, self.next_replay_answer());
+        let snapshot = fresh_snapshot(self.next_replay_answer());
         self.replay_snapshot = Some(snapshot.clone());
         self.mode = Mode::Replay;
+        self.puzzle_date = None;
         self.apply_snapshot(snapshot);
         self.save_async();
     }
@@ -284,25 +281,27 @@ impl State {
     }
 
     fn load_mode_snapshot(&mut self) {
-        let snapshot = match self.mode {
-            Mode::Daily => self.daily_snapshot.clone(),
-            Mode::Replay => self.replay_snapshot.clone(),
-        };
-        if let Some(snapshot) = snapshot {
-            self.apply_snapshot(snapshot);
-        } else {
-            self.puzzle_date = None;
-            self.answer.clear();
-            self.guesses.clear();
-            self.current_guess.clear();
-            self.is_game_over = false;
-            self.won = false;
-            self.message = "Le Word is unavailable. Try again soon.".to_string();
+        match self.mode {
+            Mode::Daily => {
+                if let Some(snapshot) = self.daily_snapshot.clone() {
+                    self.puzzle_date = Some(snapshot.puzzle_date);
+                    self.apply_snapshot(snapshot.board);
+                } else {
+                    self.clear_unavailable_board();
+                }
+            }
+            Mode::Replay => {
+                if let Some(snapshot) = self.replay_snapshot.clone() {
+                    self.puzzle_date = None;
+                    self.apply_snapshot(snapshot);
+                } else {
+                    self.clear_unavailable_board();
+                }
+            }
         }
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
-        self.puzzle_date = snapshot.puzzle_date;
         self.answer = snapshot.answer;
         self.guesses = snapshot.guesses;
         self.current_guess = snapshot.current_guess;
@@ -311,13 +310,30 @@ impl State {
         self.message = snapshot_message(self.mode, self);
     }
 
+    fn clear_unavailable_board(&mut self) {
+        self.puzzle_date = None;
+        self.answer.clear();
+        self.guesses.clear();
+        self.current_guess.clear();
+        self.is_game_over = false;
+        self.won = false;
+        self.message = "Le Word is unavailable. Try again soon.".to_string();
+    }
+
     fn store_active_snapshot(&mut self) {
         if self.answer.is_empty() {
             return;
         }
         let snapshot = snapshot_from_state(self);
         match self.mode {
-            Mode::Daily => self.daily_snapshot = Some(snapshot),
+            Mode::Daily => {
+                if let Some(puzzle_date) = self.puzzle_date {
+                    self.daily_snapshot = Some(DailySnapshot {
+                        puzzle_date,
+                        board: snapshot,
+                    });
+                }
+            }
             Mode::Replay => self.replay_snapshot = Some(snapshot),
         }
     }
@@ -326,7 +342,7 @@ impl State {
         let daily_answer = self
             .daily_snapshot
             .as_ref()
-            .map(|snapshot| snapshot.answer.as_str());
+            .map(|snapshot| snapshot.board.answer.as_str());
         self.svc
             .replay_answer(&self.answer, daily_answer)
             .to_string()
@@ -336,22 +352,36 @@ impl State {
         if self.answer.is_empty() {
             return;
         }
-        self.svc.save_game_task(GameParams {
-            user_id: self.user_id,
-            mode: self.mode.as_str().to_string(),
-            puzzle_date: self.puzzle_date,
-            answer_word: self.answer.clone(),
-            guesses: serde_json::to_value(&self.guesses).unwrap_or_default(),
-            current_guess: self.current_guess.clone(),
-            is_game_over: self.is_game_over,
-            won: self.won,
-        });
+        let guesses = serde_json::to_value(&self.guesses).unwrap_or_default();
+        match self.mode {
+            Mode::Daily => {
+                let Some(puzzle_date) = self.puzzle_date else {
+                    return;
+                };
+                self.svc.save_daily_game_task(GameParams {
+                    user_id: self.user_id,
+                    puzzle_date,
+                    answer_word: self.answer.clone(),
+                    guesses,
+                    current_guess: self.current_guess.clone(),
+                    is_game_over: self.is_game_over,
+                    won: self.won,
+                });
+            }
+            Mode::Replay => self.svc.save_replay_game_task(ReplayGameParams {
+                user_id: self.user_id,
+                answer_word: self.answer.clone(),
+                guesses,
+                current_guess: self.current_guess.clone(),
+                is_game_over: self.is_game_over,
+                won: self.won,
+            }),
+        }
     }
 }
 
-fn fresh_snapshot(puzzle_date: Option<NaiveDate>, answer: String) -> Snapshot {
+fn fresh_snapshot(answer: String) -> Snapshot {
     Snapshot {
-        puzzle_date,
         answer,
         guesses: Vec::new(),
         current_guess: String::new(),
@@ -360,9 +390,18 @@ fn fresh_snapshot(puzzle_date: Option<NaiveDate>, answer: String) -> Snapshot {
     }
 }
 
-fn snapshot_from_game(game: &Game) -> Snapshot {
+fn snapshot_from_daily_game(game: &Game) -> Snapshot {
     Snapshot {
-        puzzle_date: game.puzzle_date,
+        answer: game.answer_word.clone(),
+        guesses: serde_json::from_value(game.guesses.clone()).unwrap_or_default(),
+        current_guess: game.current_guess.clone(),
+        is_game_over: game.is_game_over,
+        won: game.won,
+    }
+}
+
+fn snapshot_from_replay_game(game: &ReplayGame) -> Snapshot {
+    Snapshot {
         answer: game.answer_word.clone(),
         guesses: serde_json::from_value(game.guesses.clone()).unwrap_or_default(),
         current_guess: game.current_guess.clone(),
@@ -373,7 +412,6 @@ fn snapshot_from_game(game: &Game) -> Snapshot {
 
 fn snapshot_from_state(state: &State) -> Snapshot {
     Snapshot {
-        puzzle_date: state.puzzle_date,
         answer: state.answer.clone(),
         guesses: state.guesses.clone(),
         current_guess: state.current_guess.clone(),

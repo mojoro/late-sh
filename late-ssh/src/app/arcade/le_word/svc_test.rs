@@ -47,20 +47,16 @@ async fn queued_game_saves_preserve_transition_order() {
     let (activity_tx, _) = broadcast::channel::<ActivityEvent>(8);
     let svc = LeWordService::new(test_db.db.clone(), activity_tx);
 
-    svc.save_game_task(GameParams {
+    svc.save_replay_game_task(ReplayGameParams {
         user_id: user.id,
-        mode: "replay".to_string(),
-        puzzle_date: None,
         answer_word: "hunch".to_string(),
         guesses: serde_json::json!(["glass"]),
         current_guess: String::new(),
         is_game_over: false,
         won: false,
     });
-    svc.save_game_task(GameParams {
+    svc.save_replay_game_task(ReplayGameParams {
         user_id: user.id,
-        mode: "replay".to_string(),
-        puzzle_date: None,
         answer_word: "shade".to_string(),
         guesses: serde_json::json!([]),
         current_guess: String::new(),
@@ -70,11 +66,9 @@ async fn queued_game_saves_preserve_transition_order() {
     svc.flush_game_saves().await.expect("flush queued saves");
 
     let replay = svc
-        .load_games(user.id)
+        .load_replay_game(user.id)
         .await
-        .expect("load saved games")
-        .into_iter()
-        .find(|game| game.mode == "replay")
+        .expect("load saved replay game")
         .expect("saved replay");
     assert_eq!(replay.answer_word, "shade");
     assert!(

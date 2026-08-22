@@ -69,6 +69,7 @@ pub fn draw_game(frame: &mut Frame, area: Rect, state: &State, show_bottom_bar: 
             ("Enter", "guess"),
             ("1/2", "daily/replay"),
             ("0x2", "new"),
+            ("?", "help"),
             ("!", "rules"),
             ("Esc", "exit"),
         ]),
