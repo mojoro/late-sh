@@ -95,6 +95,7 @@ fn test_sudoku_games(user_id: Uuid) -> Vec<late_core::models::sudoku::Game> {
             puzzle_seed: idx as i64,
             grid: serde_json::to_value(grid).expect("sudoku grid json"),
             fixed_mask: serde_json::to_value(fixed_mask).expect("sudoku fixed mask json"),
+            notes: serde_json::to_value([[0u16; 9]; 9]).expect("sudoku notes json"),
             is_game_over: false,
             score: 0,
         }
