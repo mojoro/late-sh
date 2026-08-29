@@ -144,6 +144,18 @@ const CURSOR_SHAPE_STEADY_BLOCK: &[u8] = b"\x1b[2 q";
 const CURSOR_SHAPE_DEFAULT: &[u8] = b"\x1b[0 q";
 const CURSOR_SHAPE_STEADY_UNDERLINE: &[u8] = b"\x1b[4 q";
 
+/// Name the window we're borrowing. `CSI 22;2t` pushes the title the user
+/// already had onto the terminal's own stack first, so [`POP_WINDOW_TITLE`]
+/// can hand it back on the way out: an `ssh late.sh` in one tab of ten should
+/// be findable by name without permanently renaming that tab. Terminals that
+/// implement neither leave the title alone, which is the behaviour we had.
+/// The known tradeoff: a terminal that sets titles (OSC 2) but lacks the
+/// title stack (tmux panes, for one) keeps "late.sh" after exit, since the
+/// old title cannot be read back. Every title-setting program shares it.
+const SET_WINDOW_TITLE: &[u8] = b"\x1b[22;2t\x1b]2;late.sh\x1b\\";
+/// `CSI 23;2t`: restore the pushed title on the way out.
+const POP_WINDOW_TITLE: &[u8] = b"\x1b[23;2t";
+
 #[derive(Clone, Default)]
 pub(super) struct SharedBuffer {
     inner: Arc<Mutex<Vec<u8>>>,
@@ -190,6 +202,7 @@ pub struct SessionConfig {
     pub stream_service: crate::app::stream::svc::StreamService,
     pub chat_service: ChatService,
     pub translation_service: crate::app::ai::translate::TranslationService,
+    pub summary_service: crate::app::ai::summary::SummaryService,
     pub notification_service: NotificationService,
     pub article_service: ArticleService,
     pub feed_service: crate::app::chat::feeds::svc::FeedService,
@@ -349,6 +362,11 @@ pub struct SessionConfig {
     /// This device's stored home rail layout, or `None` when the key has never
     /// been configured and should follow the account default.
     pub key_layout: Option<late_core::models::user_ssh_key::KeyLayout>,
+    /// When you last left the app on this device (the moment the keyboard
+    /// went quiet before the previous session on this key ended), or `None`
+    /// for a keyless session or a device with no mark yet. The bare
+    /// `/summary` window; see `ChatState::device_left_at`.
+    pub key_left_at: Option<chrono::DateTime<chrono::Utc>>,
     pub afk_users: crate::state::AfkUsers,
     pub username_directory: Option<crate::usernames::UsernameDirectory>,
     /// Live 24h username effects, shared process-wide (snapshot-swap; see
@@ -357,6 +375,13 @@ pub struct SessionConfig {
     /// Running `/pomodoro` countdowns, shared process-wide (snapshot-swap; see
     /// `common/pomodoro.rs`).
     pub pomodoro_directory: Option<PomodoroDirectory>,
+    /// The crown, `/crown` and `/crown take`. `None` in test harnesses that
+    /// build an app without one; the glyph then simply never appears.
+    pub crown_service: Option<crate::app::crown::svc::CrownService>,
+    /// The pot, `/pot` and `/pot buy N`. `None` in test harnesses that build
+    /// an app without one; the panel then renders dashes and the commands
+    /// say so.
+    pub pot_service: Option<crate::app::pot::svc::PotService>,
     pub activity_feed_rx: Option<broadcast::Receiver<ActivityEvent>>,
     pub initial_announcements: Option<crate::app::announcements::LoginAnnouncements>,
     pub user_id: Uuid,
@@ -426,6 +451,7 @@ pub struct App {
     pub(crate) show_profile_modal: bool,
     pub(crate) show_sheet_modal: bool,
     pub(crate) show_poll_modal: bool,
+    pub(crate) show_gild_modal: bool,
     pub(crate) show_bonsai_modal: bool,
     pub(crate) show_bonsai_v2_modal: bool,
     pub(crate) show_lobby_modal: bool,
@@ -474,10 +500,10 @@ pub struct App {
     /// Per-author drunk levels (1-4) copied from the shared lobby about once
     /// a second; chat author labels tint from this owned map, never the mutex.
     pub(crate) drunk_levels: HashMap<Uuid, u8>,
-    /// Resolved 24h username-effect styles, rebuilt from the flair directory
-    /// about once a second (which also steps shimmer); renderers read this
-    /// owned map, never the directory mutex.
-    pub(crate) name_styles: HashMap<Uuid, crate::app::common::username_effect::NameStyle>,
+    /// Resolved name flair (username-effect style and rented title), rebuilt
+    /// from the flair directory about once a second (which also steps
+    /// shimmer); renderers read this owned map, never the directory mutex.
+    pub(crate) name_flair: HashMap<Uuid, crate::app::common::username_effect::ResolvedName>,
     /// Per-peer `/pomodoro` badges, rebuilt from the pomodoro directory on the
     /// same ~1s cadence; chat author labels read this owned map, never the
     /// directory mutex.
@@ -500,6 +526,19 @@ pub struct App {
     pub(super) last_username_directory: Option<Arc<HashMap<Uuid, String>>>,
     pub(super) flair_directory: Option<crate::app::common::username_effect::NameFlairDirectory>,
     pub(super) pomodoro_directory: Option<PomodoroDirectory>,
+    pub(super) crown_service: Option<crate::app::crown::svc::CrownService>,
+    /// The process-shared crown holder, read on the ~1s edge and folded into
+    /// `name_flair`, so no render ever queries for the glyph.
+    pub(super) crown_holder_rx:
+        Option<watch::Receiver<Option<crate::app::crown::svc::CrownHolder>>>,
+    pub(super) crown_events_rx: Option<broadcast::Receiver<crate::app::crown::svc::CrownEvent>>,
+    pub(super) pot_service: Option<crate::app::pot::svc::PotService>,
+    /// The process-shared pot, read on the ~1s edge into `pot_view` so no
+    /// render ever queries for it.
+    pub(super) pot_snapshot_rx: Option<watch::Receiver<Arc<crate::app::pot::svc::PotSnapshot>>>,
+    pub(super) pot_events_rx: Option<broadcast::Receiver<crate::app::pot::svc::PotEvent>>,
+    /// What the sidebar's pot panel draws, projected for this viewer.
+    pub(crate) pot_view: crate::app::pot::state::PotView,
     pub(super) active_users: Option<ActiveUsers>,
     pub(super) afk_users: crate::state::AfkUsers,
     pub(super) username_directory: Option<crate::usernames::UsernameDirectory>,
@@ -558,6 +597,7 @@ pub struct App {
     /// House table embedded chat, same reasoning as the daily cache.
     pub(crate) house_chat_rows_cache: chat::ui::ChatRowsCache,
     pub(crate) poll_modal_state: chat::polls::state::PollModalState,
+    pub(crate) gild_modal_state: chat::gild::state::GildModalState,
     pub(crate) room_search_modal_state: crate::app::room_search_modal::state::RoomSearchModalState,
     pub(crate) room_info_modal_state: crate::app::room_info_modal::state::RoomInfoModalState,
     pub(crate) booth_modal_state: crate::app::audio::booth::state::BoothModalState,
@@ -923,6 +963,7 @@ impl App {
             && !self.show_profile_modal
             && !self.show_sheet_modal
             && !self.show_poll_modal
+            && !self.show_gild_modal
             && !self.show_bonsai_modal
             && !self.show_bonsai_v2_modal
             && !self.show_lobby_modal
@@ -1273,6 +1314,7 @@ impl App {
             show_profile_modal: false,
             show_sheet_modal: false,
             show_poll_modal: false,
+            show_gild_modal: false,
             show_bonsai_modal: false,
             show_bonsai_v2_modal: false,
             show_lobby_modal: false,
@@ -1306,7 +1348,7 @@ impl App {
             clubhouse_graybeard_id: None,
             clubhouse_bot_id: None,
             drunk_levels: HashMap::new(),
-            name_styles: HashMap::new(),
+            name_flair: HashMap::new(),
             peer_pomodoros: HashMap::new(),
             online_count: active_users
                 .as_ref()
@@ -1318,6 +1360,25 @@ impl App {
             last_username_directory: None,
             flair_directory: config.flair_directory,
             pomodoro_directory: config.pomodoro_directory,
+            crown_holder_rx: config
+                .crown_service
+                .as_ref()
+                .map(crate::app::crown::svc::CrownService::subscribe_holder),
+            crown_events_rx: config
+                .crown_service
+                .as_ref()
+                .map(crate::app::crown::svc::CrownService::subscribe_events),
+            crown_service: config.crown_service,
+            pot_snapshot_rx: config
+                .pot_service
+                .as_ref()
+                .map(crate::app::pot::svc::PotService::subscribe_snapshot),
+            pot_events_rx: config
+                .pot_service
+                .as_ref()
+                .map(crate::app::pot::svc::PotService::subscribe_events),
+            pot_service: config.pot_service,
+            pot_view: crate::app::pot::state::PotView::default(),
             active_users: active_users.clone(),
             afk_users: afk_users.clone(),
             username_directory: config.username_directory,
@@ -1357,6 +1418,7 @@ impl App {
                 chat::state::ChatServices {
                     chat: config.chat_service,
                     translation: config.translation_service,
+                    summary: config.summary_service,
                     notifications: config.notification_service,
                     articles: config.article_service.clone(),
                     feeds: config.feed_service.clone(),
@@ -1364,8 +1426,12 @@ impl App {
                     work: config.work_service.clone(),
                     cyberspace: config.cyberspace_service.clone(),
                 },
-                config.user_id,
-                config.permissions,
+                chat::state::ChatSession {
+                    user_id: config.user_id,
+                    username: config.username.clone(),
+                    permissions: config.permissions,
+                    device_left_at: config.key_left_at,
+                },
                 active_users.clone(),
                 notifier.clone(),
                 config.mention_ladders.clone(),
@@ -1377,6 +1443,7 @@ impl App {
             daily_chat_rows_cache: chat::ui::ChatRowsCache::default(),
             house_chat_rows_cache: chat::ui::ChatRowsCache::default(),
             poll_modal_state: chat::polls::state::PollModalState::new(),
+            gild_modal_state: chat::gild::state::GildModalState::new(),
             room_search_modal_state:
                 crate::app::room_search_modal::state::RoomSearchModalState::default(),
             room_info_modal_state: crate::app::room_info_modal::state::RoomInfoModalState::default(
@@ -1552,6 +1619,10 @@ impl App {
         }
         app.chat
             .set_favorite_room_ids(app.profile_state.profile().favorite_room_ids.clone());
+        app.chat
+            .set_viewer_tz(crate::app::profile::svc::parse_account_tz(
+                app.profile_state.profile().timezone.as_deref(),
+            ));
         app.chat.sync_selection();
         app.sync_visible_chat_room();
         Ok(app)
@@ -1988,13 +2059,11 @@ impl App {
         if self.screen == Screen::Artboard {
             self.deactivate_artboard_interaction();
             self.leave_dartboard();
-            self.force_full_repaint();
         }
 
         if self.screen == Screen::Lateania {
             self.leave_lateania();
             self.door_delete_confirm = false;
-            self.force_full_repaint();
         }
 
         // Leaving the Games hub drops its transient prompts. Esc handles the
@@ -2008,7 +2077,6 @@ impl App {
 
         if self.screen == Screen::Rebels {
             self.leave_rebels();
-            self.force_full_repaint();
         }
 
         // The three roguelike doors detach instead of tearing down: a running
@@ -2025,10 +2093,6 @@ impl App {
         {
             self.leave_nethack();
         }
-        if self.screen == Screen::Nethack {
-            self.force_full_repaint();
-        }
-
         if self.screen == Screen::Dcss
             && !self
                 .dcss_state
@@ -2037,10 +2101,6 @@ impl App {
         {
             self.leave_dcss();
         }
-        if self.screen == Screen::Dcss {
-            self.force_full_repaint();
-        }
-
         if self.screen == Screen::Brogue
             && !self
                 .brogue_state
@@ -2049,38 +2109,28 @@ impl App {
         {
             self.leave_brogue();
         }
-        if self.screen == Screen::Brogue {
-            self.force_full_repaint();
-        }
-
         if self.screen == Screen::Usurper {
             self.leave_usurper();
-            self.force_full_repaint();
         }
 
         if self.screen == Screen::Dopewars {
             self.leave_dopewars();
-            self.force_full_repaint();
         }
 
         if self.screen == Screen::Bashquest {
             self.leave_bashquest();
-            self.force_full_repaint();
         }
 
         if self.screen == Screen::Codekeep {
             self.leave_codekeep();
-            self.force_full_repaint();
         }
 
         if self.screen == Screen::DailyMatch && screen != Screen::DailyMatch {
             self.daily.close_board();
-            self.force_full_repaint();
         }
 
         if self.screen == Screen::HouseTable && screen != Screen::HouseTable {
             self.house.close();
-            self.force_full_repaint();
         }
 
         if self.screen == Screen::Scratchpad && screen != Screen::Scratchpad {
@@ -2090,10 +2140,23 @@ impl App {
             // "left the pairing" on their next sync, the same RAII
             // teardown Artboard uses for its color slot.
             self.scratchpad = None;
-            self.force_full_repaint();
         }
 
+        let screen_changed = self.screen != screen;
         self.screen = screen;
+
+        // Every top-level move repaints from scratch. ratatui only re-emits
+        // cells whose contents changed, and the two layouts rarely disagree
+        // on every cell: leaving Home for the Arcade used to strand the
+        // sidebar's bonsai emoji on screen, because a wide glyph the new
+        // layout writes a space over occupies two columns and only one of
+        // them differs. Clearing costs one full frame per page switch, which
+        // every door and the Artboard already paid for the same reason. A
+        // same-screen call (the nav key for the page already open) changes no
+        // layout and skips the clear.
+        if screen_changed {
+            self.force_full_repaint();
+        }
 
         if matches!(self.screen, Screen::Dashboard) {
             self.chat.request_list();
@@ -2637,12 +2700,17 @@ impl App {
         self.audio.persist_radio_station(station);
     }
 
-    pub fn request_paired_clipboard_image_upload(&mut self, room_id: Option<Uuid>) -> bool {
+    pub(crate) fn request_paired_clipboard_image_upload(
+        &mut self,
+        room_id: Option<Uuid>,
+        reply_target: Option<crate::app::chat::state::ReplyTarget>,
+    ) -> bool {
         let Some(registry) = &self.paired_client_registry else {
             return false;
         };
         if registry.request_clipboard_image(&self.session_token) {
-            self.chat.begin_pending_clipboard_image_upload(room_id);
+            self.chat
+                .begin_pending_clipboard_image_upload(room_id, reply_target);
             return true;
         }
         false
@@ -3007,6 +3075,195 @@ impl App {
         changed
     }
 
+    /// The crown's two commands and the answers to them. The glyph itself is
+    /// not handled here: it rides `name_flair`, resolved on the ~1s edge in
+    /// `tick.rs` from the process-shared holder, so a takeover on another
+    /// replica moves it with no event of any kind.
+    pub(crate) fn tick_crown(&mut self) -> bool {
+        let mut changed = false;
+
+        if let Some(command) = self.chat.take_requested_crown() {
+            changed = true;
+            match &self.crown_service {
+                // Only a test harness builds an app without one; saying so
+                // beats a command that silently does nothing.
+                None => {
+                    self.banner = Some(Banner::error("The crown is not available here."));
+                }
+                Some(service) => match command {
+                    crate::app::chat::state::CrownCommand::Status => {
+                        service.status_task(self.user_id);
+                    }
+                    crate::app::chat::state::CrownCommand::Take => {
+                        service.take_task(self.user_id, self.username.clone());
+                        self.banner = Some(Banner::success("Reaching for the crown..."));
+                    }
+                },
+            }
+        }
+
+        let mut events = Vec::new();
+        if let Some(rx) = &mut self.crown_events_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        self.crown_events_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            use crate::app::common::primitives::thousands;
+            use crate::app::crown::svc::CrownEvent;
+            match event {
+                CrownEvent::Status { user_id, line } if user_id == self.user_id => {
+                    changed = true;
+                    self.banner = Some(Banner::info(&line));
+                }
+                CrownEvent::Failed { user_id, message } if user_id == self.user_id => {
+                    changed = true;
+                    self.banner = Some(Banner::error(&message));
+                }
+                CrownEvent::Taken {
+                    taker_id,
+                    taker_balance,
+                    price,
+                    ref from,
+                } if taker_id == self.user_id => {
+                    changed = true;
+                    let cost = thousands(price);
+                    let balance = thousands(taker_balance);
+                    self.banner = Some(Banner::success(&match from {
+                        Some(from) => format!(
+                            "The crown is yours, taken from {from} for {cost} chips (balance {balance})"
+                        ),
+                        None => format!(
+                            "The crown is yours, claimed vacant for {cost} chips (balance {balance})"
+                        ),
+                    }));
+                }
+                // The deposed holder: a glyph vanishing off your own name
+                // with no explanation reads as a bug, so they are told who
+                // has it now. This arrives off the Postgres notify, so it
+                // lands whichever replica they are connected to.
+                CrownEvent::Deposed {
+                    user_id,
+                    ref taker_username,
+                    price,
+                } if user_id == self.user_id => {
+                    changed = true;
+                    self.banner = Some(Banner::error(&format!(
+                        "{taker_username} stole the crown from you for {} chips",
+                        thousands(price)
+                    )));
+                }
+                CrownEvent::Status { .. }
+                | CrownEvent::Failed { .. }
+                | CrownEvent::Taken { .. }
+                | CrownEvent::Deposed { .. } => {}
+            }
+        }
+
+        changed
+    }
+
+    /// The pot's two commands and the answers to them. The panel itself is
+    /// not handled here: it rides `pot_view`, resolved on the ~1s edge in
+    /// `tick.rs` from the process-shared snapshot, so a buy on another
+    /// replica moves it with no event of any kind.
+    pub(crate) fn tick_pot(&mut self) -> bool {
+        let mut changed = false;
+
+        if let Some(command) = self.chat.take_requested_pot() {
+            changed = true;
+            match &self.pot_service {
+                // Only a test harness builds an app without one; saying so
+                // beats a command that silently does nothing.
+                None => {
+                    self.banner = Some(Banner::error("The pot is not available here."));
+                }
+                Some(service) => match command {
+                    // Answered straight from the shared snapshot the panel
+                    // already reads: the status costs no query at all.
+                    crate::app::chat::state::PotCommand::Status => {
+                        let line = service.status_for(self.user_id).line();
+                        self.banner = Some(Banner::info(&line));
+                    }
+                    crate::app::chat::state::PotCommand::Buy { count } => {
+                        service.buy_task(self.user_id, count);
+                    }
+                },
+            }
+        }
+
+        let mut events = Vec::new();
+        if let Some(rx) = &mut self.pot_events_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        self.pot_events_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            use crate::app::common::primitives::thousands;
+            use crate::app::pot::svc::PotEvent;
+            match event {
+                PotEvent::Bought {
+                    user_id,
+                    tickets,
+                    held,
+                    price,
+                    balance,
+                } if user_id == self.user_id => {
+                    changed = true;
+                    self.banner = Some(Banner::success(&format!(
+                        "{} tickets for {} chips, you hold {} (balance {})",
+                        thousands(tickets),
+                        thousands(price),
+                        thousands(held),
+                        thousands(balance)
+                    )));
+                }
+                // The winner, wherever they are connected: this arrives off
+                // the Postgres notify, not off the sweeping replica's own
+                // broadcast.
+                PotEvent::Won {
+                    user_id,
+                    payout,
+                    winner_tickets,
+                    total_tickets,
+                } if user_id == self.user_id => {
+                    changed = true;
+                    self.banner = Some(Banner::success(&format!(
+                        "You won the pot: {} chips on {} of {} tickets",
+                        thousands(payout),
+                        thousands(winner_tickets),
+                        thousands(total_tickets)
+                    )));
+                }
+                PotEvent::Failed { user_id, message } if user_id == self.user_id => {
+                    changed = true;
+                    self.banner = Some(Banner::error(&message));
+                }
+                PotEvent::Bought { .. } | PotEvent::Won { .. } | PotEvent::Failed { .. } => {}
+            }
+        }
+
+        changed
+    }
+
     /// Hand a stream URL to the user: a capable paired CLI opens the
     /// browser; everyone always gets (or, with `modal_only_without_cli`,
     /// falls back to) the URL + QR modal.
@@ -3168,6 +3425,7 @@ impl App {
         for command in terminal_image_cleanup_commands() {
             buf.extend_from_slice(&command);
         }
+        buf.extend_from_slice(SET_WINDOW_TITLE);
         // 1000h = basic mouse tracking (button press/release + scroll wheel)
         // 1003h = any-event mouse tracking (motion reports with or without a
         // button held). Dartboard needs drag + hover parity with standalone.
@@ -3195,6 +3453,7 @@ impl App {
         // 1000l = disable basic mouse tracking
         // OSC 111 = reset terminal background color
         buf.extend_from_slice(b"\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b]111\x1b\\");
+        buf.extend_from_slice(POP_WINDOW_TITLE);
         for command in terminal_image_cleanup_commands() {
             buf.extend_from_slice(&command);
         }
@@ -3212,6 +3471,16 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // The device mark: when this terminal's keyboard went quiet, not when
+        // the connection closed. A terminal parked open overnight and shut in
+        // the morning left last night. Keyless sessions (ghost bots, tests)
+        // have no device to remember it on.
+        if let Some(fingerprint) = self.key_fingerprint.clone()
+            && let Ok(idle) = chrono::Duration::from_std(self.last_input_at.elapsed())
+        {
+            self.profile_state
+                .set_device_left_at(fingerprint, chrono::Utc::now() - idle);
+        }
         if self.session_token.is_empty() {
             return;
         }

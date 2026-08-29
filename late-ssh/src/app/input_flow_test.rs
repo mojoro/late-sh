@@ -2,15 +2,16 @@
 
 use crate::authz::Permissions;
 use crate::test_helpers::{
-    assert_render_not_contains_for, chat_compose_app, make_app, make_app_with_chat_service,
-    make_app_with_permissions, new_test_db, render_plain, wait_for_render_contains, wait_until,
-    with_session_key,
+    assert_render_not_contains_for, chat_compose_app, make_app, make_app_in_world,
+    make_app_with_chat_service, make_app_with_permissions, new_test_db, render_plain, strip_ansi,
+    wait_for_render_contains, wait_for_render_not_contains, wait_until, with_session_key,
 };
 use late_core::models::cyberspace_account::CyberspaceAccount;
 use late_core::models::user::{RightSidebarMode, RoomListMode};
-use late_core::models::user_ssh_key::{KeyLayout, UserSshKey};
+use late_core::models::user_ssh_key::{KeyLayout, UserSshKey, extract_key_layout};
 use late_core::models::{
     chat_message::{ChatMessage, ChatMessageParams},
+    chat_message_gild::{ChatMessageGild, GildPlacement, GildTier},
     chat_message_reaction::ChatMessageReaction,
     chat_room::ChatRoom,
     chat_room_member::ChatRoomMember,
@@ -183,6 +184,7 @@ async fn backtick_hops_out_of_lateania_and_back_in_while_the_window_is_live() {
 #[tokio::test]
 async fn games_hub_config_modal_saves_and_clears_the_door_rc() {
     use crate::app::common::primitives::Screen;
+    use crate::app::door::hub::state::HubGame;
     use late_core::models::door_rc::{DoorRc, DoorRcGame};
 
     let test_db = new_test_db().await;
@@ -190,10 +192,15 @@ async fn games_hub_config_modal_saves_and_clears_the_door_rc() {
     let client = test_db.db.get().await.expect("db client");
     let mut app = make_app(test_db.db.clone(), user.id, "door-rc-flow-it");
 
-    // Walk the hub sidebar to NetHack (Lateania, DCSS, NetHack) and open the
-    // config box.
+    // Walk the hub sidebar down to NetHack and open the config box. The step
+    // count comes from the selector order itself, so a game inserted above
+    // NetHack moves the cursor here instead of opening another game's config.
+    let steps = HubGame::ALL
+        .iter()
+        .position(|game| *game == HubGame::Nethack)
+        .expect("nethack is in the selector");
     app.set_screen(Screen::Games);
-    app.handle_input(b"jj");
+    app.handle_input(&b"j".repeat(steps));
     app.handle_input(b"c");
     let frame = render_plain(&mut app);
     assert!(
@@ -1017,6 +1024,19 @@ async fn chat_reaction_leader_second_f_shows_reaction_owners_modal() {
     ChatMessageReaction::toggle(&client, message.id, thinking.id, "🤔")
         .await
         .expect("thinking reaction");
+    // Two gilds at different tiers: the overlay lists them above the
+    // reactions, best tier first, with the buyer under each.
+    {
+        let mut gild_client = test_db.db.get().await.expect("db client");
+        let tx = gild_client.transaction().await.expect("tx");
+        for (buyer, tier) in [(&thinking, GildTier::Bronze), (&thumbs_1, GildTier::Gold)] {
+            let placed = ChatMessageGild::place_in_tx(&tx, message.id, author.id, buyer.id, tier)
+                .await
+                .expect("place gild");
+            assert!(matches!(placed, GildPlacement::Placed(_)), "{placed:?}");
+        }
+        tx.commit().await.expect("commit gilds");
+    }
 
     let mut app = make_app(test_db.db.clone(), viewer.id, "f-owners-flow-it");
     wait_for_render_contains(&mut app, "owner reaction target").await;
@@ -1029,7 +1049,20 @@ async fn chat_reaction_leader_second_f_shows_reaction_owners_modal() {
     wait_for_render_contains(&mut app, "👍 6 reactions").await;
     wait_for_render_contains(&mut app, "[+2 more]").await;
     wait_for_render_contains(&mut app, "@f-owners-thinking").await;
+    wait_for_render_contains(&mut app, "◆◆◆ 1 Gold gild").await;
+    wait_for_render_contains(&mut app, "◆ 1 Bronze gild").await;
     let plain = render_plain(&mut app);
+    let gold_at = plain.find("◆◆◆ 1 Gold gild").expect("gold block");
+    let bronze_at = plain.find("◆ 1 Bronze gild").expect("bronze block");
+    let thumbs_at = plain.find("👍 6 reactions").expect("reaction block");
+    assert!(
+        gold_at < bronze_at && bronze_at < thumbs_at,
+        "gilds lead, best tier first, then reactions: {plain:?}"
+    );
+    assert!(
+        plain[gold_at..bronze_at].contains("@f-owners-thumbs-1"),
+        "the gold buyer sits under the gold block: {plain:?}"
+    );
     assert!(
         !plain.contains("1 👍"),
         "reaction picker should be dismissed under owner modal: {plain:?}"
@@ -1660,7 +1693,7 @@ async fn cycling_rails_persists_only_to_authenticating_key_and_survives_unrelate
             let db = db.clone();
             async move {
                 let client = db.get().await.expect("db client");
-                UserSshKey::layout_for(&client, user.id, "SHA256:phone")
+                stored_layout(&client, user.id, "SHA256:phone")
                     .await
                     .expect("phone layout")
                     == Some(KeyLayout {
@@ -1673,7 +1706,7 @@ async fn cycling_rails_persists_only_to_authenticating_key_and_survives_unrelate
     )
     .await;
     assert_eq!(
-        UserSshKey::layout_for(&client, user.id, "SHA256:desktop")
+        stored_layout(&client, user.id, "SHA256:desktop")
             .await
             .expect("desktop layout"),
         None,
@@ -1724,7 +1757,7 @@ async fn cycling_rails_persists_only_to_authenticating_key_and_survives_unrelate
         "the legacy mirror must stay in step with the account default"
     );
     assert_eq!(
-        UserSshKey::layout_for(&client, user.id, "SHA256:phone")
+        stored_layout(&client, user.id, "SHA256:phone")
             .await
             .expect("phone layout after settings save"),
         Some(KeyLayout {
@@ -1734,7 +1767,7 @@ async fn cycling_rails_persists_only_to_authenticating_key_and_survives_unrelate
         "the unrelated account save must preserve this device's layout"
     );
     assert_eq!(
-        UserSshKey::layout_for(&client, user.id, "SHA256:desktop")
+        stored_layout(&client, user.id, "SHA256:desktop")
             .await
             .expect("desktop layout after settings save"),
         None,
@@ -1952,4 +1985,190 @@ async fn history_modal_opens_from_command_and_closes_on_esc() {
         !frame.contains("History ·"),
         "expected the history modal gone after Esc; frame={frame:?}"
     );
+}
+
+/// Ctrl+L is the escape hatch for a terminal left damaged by something outside
+/// late.sh. It has to re-emit every cell: the failure mode worth pinning is a
+/// repaint that clears the screen and then sends an empty diff, leaving the
+/// user staring at a blank terminal that is worse than the damage.
+#[tokio::test]
+async fn ctrl_l_repaints_the_whole_screen_rather_than_blanking_it() {
+    let test_db = new_test_db().await;
+    let user = create_test_user(&test_db.db, "ctrl-l-repaint").await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, user.id)
+        .await
+        .expect("join lounge room");
+    let mut app = make_app(test_db.db.clone(), user.id, "ctrl-l-repaint-flow-it");
+
+    wait_for_render_contains(&mut app, "lounge").await;
+
+    // Let the screen settle: with nothing changed, a frame is only a small diff.
+    let _ = app.render().expect("render");
+    let settled = strip_ansi(&String::from_utf8_lossy(&app.render().expect("render")));
+
+    app.handle_input(b"\x0c");
+    let repainted = strip_ansi(&String::from_utf8_lossy(&app.render().expect("render")));
+
+    assert!(
+        repainted.contains("lounge"),
+        "expected Ctrl+L to re-emit the whole screen; repainted={repainted:?}"
+    );
+    assert!(
+        repainted.len() > settled.len(),
+        "expected the Ctrl+L frame to carry more than the settled diff; \
+         settled={} bytes, repainted={} bytes",
+        settled.len(),
+        repainted.len()
+    );
+}
+
+/// Uploading an image while replying used to come back as a plain message:
+/// both the `/paste-image` submit and reopening the composer with the finished
+/// URL run through paths that clear the reply target.
+#[tokio::test]
+async fn image_upload_keeps_the_reply_it_was_composed_against() {
+    let test_db = new_test_db().await;
+    let viewer = create_test_user(&test_db.db, "f-upload-viewer").await;
+    let author = create_test_user(&test_db.db, "f-upload-author").await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, viewer.id)
+        .await
+        .expect("join viewer");
+    ChatRoomMember::join(&client, lounge.id, author.id)
+        .await
+        .expect("join author");
+    ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: lounge.id,
+            user_id: author.id,
+            body: "upload target".to_string(),
+        },
+    )
+    .await
+    .expect("create message");
+
+    let mut app = make_app(test_db.db.clone(), viewer.id, "f-upload-flow-it");
+    app.resize(160, 32).expect("resize test terminal");
+    wait_for_render_contains(&mut app, "upload target").await;
+
+    app.handle_input(b"j");
+    app.handle_input(b"r");
+    assert!(
+        app.chat.reply_target().is_some(),
+        "r should open a reply composer"
+    );
+
+    // Stand in for the upload itself: the reply target travels with the
+    // request from here, and the composer is reopened when the URL lands.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let reply_target = app.chat.reply_target().cloned();
+    assert!(
+        app.chat
+            .begin_image_upload(Some(lounge.id), reply_target, rx)
+            .is_none(),
+        "the upload should start"
+    );
+    tx.send(Ok("https://files.late.sh/chat/x.png".to_string()))
+        .expect("deliver the uploaded url");
+
+    wait_for_render_contains(&mut app, "files.late.sh/chat/x.png").await;
+    assert!(
+        app.chat.reply_target().is_some(),
+        "the upload dropped the reply it was composed against"
+    );
+}
+
+/// A mention read in its own room used to sit on the rail badge for the rest
+/// of the session: the DB count moved but nothing republished it. Rendering
+/// the mention's message now stamps `notifications.read_at` and the service
+/// republishes the count in the same task, so the badge clears live.
+#[tokio::test]
+async fn mention_rendered_in_its_room_clears_the_rail_badge() {
+    use late_core::models::notification::Notification;
+
+    let test_db = new_test_db().await;
+    let viewer = create_test_user(&test_db.db, "f-badge-viewer").await;
+    let actor = create_test_user(&test_db.db, "f-badge-actor").await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, viewer.id)
+        .await
+        .expect("join viewer");
+    ChatRoomMember::join(&client, lounge.id, actor.id)
+        .await
+        .expect("join actor");
+    let message = ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: lounge.id,
+            user_id: actor.id,
+            body: "@f-badge-viewer over here".to_string(),
+        },
+    )
+    .await
+    .expect("create mention message");
+    Notification::create_mentions_batch(&client, &[viewer.id], actor.id, message.id, lounge.id)
+        .await
+        .expect("create mention notification");
+
+    // The session must know its own username for the rendered-mention match.
+    let mut app = make_app_in_world(
+        test_db.db.clone(),
+        viewer.id,
+        "f-badge-flow-it",
+        crate::test_helpers::SessionWorld {
+            username: Some("f-badge-viewer".to_string()),
+            ..Default::default()
+        },
+    );
+    app.resize(160, 32).expect("resize test terminal");
+
+    // The mention's message lands on screen in its own room.
+    wait_for_render_contains(&mut app, "over here").await;
+
+    // That must stamp the mention read without the Mentions entry ever being
+    // opened. The stamp rides the app tick's read-cursor flush, so keep
+    // ticking while polling for it; asserting a lit badge first would race
+    // the very fix under test (the stamp can beat the initial count render).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        app.tick();
+        app.reset_render();
+        app.render().expect("render");
+        let unread = Notification::unread_count(&client, viewer.id)
+            .await
+            .expect("unread count");
+        if unread == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the rendered mention was never stamped read"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+
+    // The count republished after the stamp committed reaches the rail: the
+    // badge is dark for good, with the mention read where it was said.
+    wait_for_render_not_contains(&mut app, "mentions (").await;
+}
+
+/// The stored rail layout, read the way bootstrap reads it.
+async fn stored_layout(
+    client: &tokio_postgres::Client,
+    user_id: Uuid,
+    fingerprint: &str,
+) -> anyhow::Result<Option<KeyLayout>> {
+    let key = UserSshKey::find_by_fingerprint(client, user_id, fingerprint).await?;
+    Ok(key.and_then(|key| extract_key_layout(&key.settings)))
 }

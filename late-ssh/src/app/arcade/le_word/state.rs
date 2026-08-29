@@ -58,8 +58,18 @@ pub struct State {
     pub message: String,
     daily_snapshot: Option<Snapshot>,
     replay_snapshot: Option<Snapshot>,
+    /// In flight only while a rolled-over day is fetching its word; see
+    /// `ensure_current_daily`.
+    word_reload_rx: Option<tokio::sync::oneshot::Receiver<Option<DailyWord>>>,
+    /// Set when a rollover fetch failed; `ensure_current_daily` holds off
+    /// until this passes, then tries again. Without it a transient DB error
+    /// at midnight left the board dead for the rest of the session.
+    word_reload_backoff_until: Option<std::time::Instant>,
     pub svc: LeWordService,
 }
+
+/// How long a failed rollover word fetch waits before the next attempt.
+const WORD_RELOAD_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl State {
     pub fn new(
@@ -99,10 +109,111 @@ impl State {
             message: String::new(),
             daily_snapshot,
             replay_snapshot,
+            word_reload_rx: None,
+            word_reload_backoff_until: None,
             svc,
         };
         state.load_mode_snapshot();
         state
+    }
+
+    /// The date of the daily board this session holds, whichever mode is on
+    /// screen: the live board in daily mode, the parked snapshot in replay.
+    /// `None` means no daily word has landed yet.
+    fn daily_puzzle_date(&self) -> Option<NaiveDate> {
+        match self.mode {
+            Mode::Daily => self.puzzle_date,
+            Mode::Replay => self
+                .daily_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.puzzle_date),
+        }
+    }
+
+    /// Roll the daily over when the UTC date changes under a live session.
+    /// The word itself lives in the database (the session's first one arrives
+    /// with the bootstrap), so this drops the stale daily immediately and
+    /// fetches the new word in the background; `poll_word_reload` installs it.
+    /// The daily date only advances once the word lands, so a failed fetch is
+    /// retried here (after `WORD_RELOAD_RETRY`) instead of leaving the board
+    /// dead until reconnect. A replay board on screen is left alone: only the
+    /// parked daily snapshot rolls. Returns true when anything changed.
+    pub fn ensure_current_daily(&mut self) -> bool {
+        let today = self.svc.today();
+        if self.daily_puzzle_date() == Some(today) {
+            return false;
+        }
+        if self.word_reload_rx.is_some() {
+            return false;
+        }
+        if let Some(until) = self.word_reload_backoff_until
+            && std::time::Instant::now() < until
+        {
+            return false;
+        }
+        self.word_reload_backoff_until = None;
+
+        // Yesterday's word must stop scoring guesses right away, whether or
+        // not the fetch succeeds.
+        self.daily_snapshot = None;
+        self.daily_word_loaded = false;
+        if self.mode == Mode::Daily {
+            self.clear_reset_pending();
+            self.load_mode_snapshot();
+            self.message = "Loading today's Le Word.".to_string();
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.word_reload_rx = Some(rx);
+        let svc = self.svc.clone();
+        // Pure state tests drive this without a runtime; the state is already
+        // cleared, and the poll below installs nothing when nothing arrives.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                let word = match svc.ensure_daily_word().await {
+                    Ok(word) => Some(word),
+                    Err(error) => {
+                        tracing::error!(error = ?error, "failed to load the rolled-over Le Word");
+                        None
+                    }
+                };
+                let _ = tx.send(word);
+            });
+        }
+        true
+    }
+
+    /// Install a word fetched by `ensure_current_daily`. Returns true when
+    /// anything changed.
+    pub fn poll_word_reload(&mut self) -> bool {
+        let Some(rx) = self.word_reload_rx.as_mut() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Some(word)) => {
+                self.word_reload_rx = None;
+                self.word_reload_backoff_until = None;
+                self.daily_snapshot =
+                    Some(fresh_snapshot(Some(word.puzzle_date), word.answer_word));
+                self.daily_word_loaded = true;
+                if self.mode == Mode::Daily {
+                    self.load_mode_snapshot();
+                }
+                true
+            }
+            Ok(None) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.word_reload_rx = None;
+                // The daily date was not advanced, so `ensure_current_daily`
+                // tries again once the backoff passes.
+                self.word_reload_backoff_until =
+                    Some(std::time::Instant::now() + WORD_RELOAD_RETRY);
+                if self.mode == Mode::Daily {
+                    self.message = "Le Word is unavailable. Retrying soon.".to_string();
+                }
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+        }
     }
 
     /// Today's word has at least one submitted guess and the run is not over.
@@ -465,3 +576,9 @@ fn score_rank(score: LetterScore) -> u8 {
         LetterScore::Absent => 1,
     }
 }
+
+// A child of this module (not a sibling in mod.rs) so the rollover tests can
+// drive the private reload channel and backoff directly.
+#[cfg(test)]
+#[path = "state_test.rs"]
+mod state_test;

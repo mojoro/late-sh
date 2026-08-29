@@ -13,6 +13,7 @@ use late_core::{
     models::{
         article::{ArticleFeedItem, NEWS_MARKER},
         chat_message::ChatMessage,
+        chat_message_gild::{ChatMessageGild, ChatMessageGildSummary, GildTier},
         chat_message_reaction::{ChatMessageReactionOwners, ChatMessageReactionSummary},
         chat_poll::ActiveChatPoll,
         chat_room::ChatRoom,
@@ -33,11 +34,14 @@ use uuid::Uuid;
 use late_core::models::chat_message::HistoryDirection;
 
 use crate::app::ai::ladder::MentionLadders;
+use crate::app::ai::summary::{
+    SummaryBasis, SummaryEvent, SummaryOutcome, SummaryService, SummaryWindow,
+};
 use crate::app::ai::translate::{TranslationEvent, TranslationOutcome, TranslationService};
 use crate::app::common::overlay::Overlay;
 use crate::app::common::theme;
 
-use crate::app::common::{composer, primitives::Banner};
+use crate::app::common::{composer, mentions, primitives::Banner};
 use crate::app::help_modal::data::HelpTopic;
 use crate::app::notify::{Notification, Notifier};
 use crate::authz::Permissions;
@@ -51,10 +55,15 @@ use crate::usernames::UsernameResolver;
 
 use super::{
     commands::{RoomScopedCommand, rank_command_matches, room_owns_command},
-    cyberspace, discover, feeds, history_modal, news, notifications,
+    cyberspace, discover, feeds,
+    gild::state::GildTarget,
+    history_modal, news, notifications,
     notifications::svc::NotificationService,
     showcase,
-    svc::{ChatEvent, ChatService, ChatSnapshot, GIFT_MAX_AMOUNT, ReportKind, RoomMemberListItem},
+    svc::{
+        ChatEvent, ChatService, ChatSnapshot, GIFT_MAX_AMOUNT, GildRefusal, ReportKind,
+        RoomMemberListItem,
+    },
     ui_text::{NewsPayload, parse_news_payload, parse_report_payload},
     work,
 };
@@ -74,6 +83,18 @@ const TERMINAL_IMAGE_MAX_COLS: u32 = 200;
 const TERMINAL_IMAGE_MAX_ROWS: u32 = 60;
 const CLIPBOARD_IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_CURSOR_FLUSH_DELAY: Duration = Duration::from_secs(2);
+
+/// How long this session's keyboard has to stay quiet before the room on
+/// screen gets an AFK line.
+///
+/// This is a threshold for *absence*, not for reading: reading produces no
+/// input at all, so a lurker who sits silent this long collects a line they
+/// did not need. That is the deliberate direction to be wrong in. A line
+/// nobody wanted costs one glance; the failure it replaced, treating a
+/// parked terminal as a reader, silently swallowed the whole day someone
+/// missed. Long enough that a coffee run does not trip it, short enough
+/// that a real absence is caught before the conversation moves on.
+const AFK_LINE_IDLE: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) type InlineImagePreview = crate::app::files::inline_image::InlineImagePreview;
 pub(crate) type InlineImageRenderSettings =
@@ -156,18 +177,26 @@ pub(crate) struct ModCommandOutput {
 pub(crate) struct PendingUrlUpload {
     pub url: String,
     pub room_id: Option<Uuid>,
+    /// The reply the composer was aiming at when the upload was asked for.
+    /// Submitting `/upload` clears the composer, so the target has to travel
+    /// with the request or the finished upload comes back as a plain message.
+    pub reply_target: Option<ReplyTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingClipboardImageUpload {
     pub room_id: Option<Uuid>,
+    /// See [`PendingUrlUpload::reply_target`]; `/paste-image` clears the
+    /// composer the same way.
+    pub reply_target: Option<ReplyTarget>,
     requested_at: Instant,
 }
 
 impl PendingClipboardImageUpload {
-    fn new(room_id: Option<Uuid>) -> Self {
+    fn new(room_id: Option<Uuid>, reply_target: Option<ReplyTarget>) -> Self {
         Self {
             room_id,
+            reply_target,
             requested_at: Instant::now(),
         }
     }
@@ -274,6 +303,71 @@ fn parse_golive_command(body: &str) -> Option<GoLiveCommand> {
 
 /// Longest `/golive` title kept; the rest is cut at the parse boundary.
 const GOLIVE_TITLE_MAX_CHARS: usize = 80;
+
+/// The crown, requested from the composer. `App` owns the crown service, so
+/// the composer just records the intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CrownCommand {
+    /// `/crown`: who wears it, for how long, and what taking it costs.
+    Status,
+    /// `/crown take`: buy it at whatever the ladder says right now.
+    Take,
+}
+
+/// `Some(Some(command))` on `/crown` or `/crown take`, `Some(None)` on
+/// anything else after `/crown` (usage banner), `None` when the line is not
+/// a crown command at all.
+fn parse_crown_command(body: &str) -> Option<Option<CrownCommand>> {
+    let rest = body.trim().strip_prefix("/crown")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(match rest.trim() {
+        "" => Some(CrownCommand::Status),
+        "take" => Some(CrownCommand::Take),
+        _ => None,
+    })
+}
+
+/// The pot, requested from the composer. `App` owns the pot service, so the
+/// composer just records the intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PotCommand {
+    /// `/pot`: size, tickets, your holding, and time to the draw.
+    Status,
+    /// `/pot buy N`: buy N tickets at the flat ticket price.
+    Buy { count: i64 },
+}
+
+/// `Some(Some(command))` on `/pot` or a well-formed `/pot buy N`,
+/// `Some(None)` on anything else after `/pot` (usage banner), `None` when the
+/// line is not a pot command at all.
+///
+/// The count is parsed here rather than in the service: a boundary that only
+/// admits 1..=(the daily cap) is what lets everything downstream trust the
+/// number; whether today still has room is the service's call.
+fn parse_pot_command(body: &str) -> Option<Option<PotCommand>> {
+    use late_core::models::pot::POT_MAX_TICKETS_PER_DAY;
+    let rest = body.trim().strip_prefix("/pot")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Some(Some(PotCommand::Status));
+    }
+    let Some(count) = rest.strip_prefix("buy ") else {
+        return Some(None);
+    };
+    Some(
+        count
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|count| (1..=POT_MAX_TICKETS_PER_DAY).contains(count))
+            .map(|count| PotCommand::Buy { count }),
+    )
+}
 
 /// An aquarium control requested from the composer (`/aquarium`,
 /// `/aquarium feed`). `App` owns the tray state and entitlements, so the
@@ -635,6 +729,10 @@ pub struct ChatState {
     room_owner_ids: HashMap<Uuid, Uuid>,
     username_rx: watch::Receiver<Arc<Vec<String>>>,
     overlay: Option<Overlay>,
+    /// A ready `/summary` that arrived while another overlay was up. It
+    /// takes the surface in `drain_summary_events` as soon as it frees,
+    /// instead of clobbering what the user is reading.
+    pending_summary_overlay: Option<Overlay>,
     news_modal: Option<NewsModalState>,
     image_modal: Option<ImageModalState>,
     /// Cells the open image modal can devote to an image, reported back from
@@ -642,9 +740,39 @@ pub struct ChatState {
     image_modal_capacity: Option<(u16, u16)>,
     pending_reaction_owners_message_id: Option<Uuid>,
     pub(crate) unread_counts: HashMap<Uuid, i64>,
-    pub(crate) room_unread_markers: HashMap<Uuid, Option<DateTime<Utc>>>,
+    /// The AFK line per room: the instant this session's human went quiet
+    /// while that room was on screen. The `new messages` divider draws
+    /// against it and `/history` opens there. It is one of two marks, and
+    /// the other one, [`ChatState::device_left_at`], is what `/summary`
+    /// reads; they never feed each other.
+    ///
+    /// Deliberately session-local and never written to the DB. "Did the
+    /// person at this terminal step away" is a fact about this terminal;
+    /// your phone being idle says nothing about your desktop.
+    ///
+    /// Placed by [`ChatState::sync_afk_line`], removed only when a message
+    /// you wrote lands in the room. Not by coming back and touching a key
+    /// (the line exists to show you where to start reading, and clearing it
+    /// on the keystroke that returns you destroys it exactly when it is
+    /// wanted), and not by `/summary` or `/history`, which do not read it
+    /// as a catch-up cursor at all in the first case and only look in the
+    /// second.
+    pub(crate) afk_lines: HashMap<Uuid, DateTime<Utc>>,
+    /// The other mark: when you last left the app on this device, the
+    /// moment the keyboard went quiet before the previous session on this
+    /// SSH key ended (`user_ssh_keys.left_at`, taken once at boot). A bare
+    /// `/summary` always reads from here, whatever the AFK line says: the
+    /// question it answers is "what happened since I was last here", and
+    /// "here" is this device, not this room. Fixed for the session, so
+    /// asking twice reads the same stretch twice; `None` for a keyless
+    /// session or a device with no mark yet.
+    device_left_at: Option<DateTime<Utc>>,
     pending_read_rooms: HashSet<Uuid>,
     pending_read_flush: PendingReadCursorFlush,
+    /// Message ids whose mentions of this user were already reported as
+    /// rendered, so a room that stays visible does not resend the same stamp
+    /// on every cursor flush. Session-local; the DB update is idempotent.
+    mention_reads_sent: HashSet<Uuid>,
     /// The DM currently held in the promoted unread-DMs group even though its
     /// unread count is already zero. See `note_sticky_unread_dm`.
     pub(crate) sticky_unread_dm: Option<Uuid>,
@@ -694,11 +822,18 @@ pub struct ChatState {
     pub(crate) chat_badges: HashMap<Uuid, String>,
     pub(crate) profile_award_badges: HashMap<Uuid, String>,
     pub(crate) message_reactions: HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
+    /// Gild markers by message. Only gilded messages have an entry, which is
+    /// almost none of them, so this stays tiny even in a busy room.
+    pub(crate) message_gilds: HashMap<Uuid, ChatMessageGildSummary>,
     pub(crate) voice_channels_by_room_id: HashMap<Uuid, VoiceChannel>,
     /// Translation handle + result feed (`app/ai/translate.rs`). Requests are
     /// fire-and-forget; results land on `translation_rx` and drain in tick.
     translation_service: TranslationService,
     translation_rx: tokio::sync::broadcast::Receiver<TranslationEvent>,
+    /// `/summary` handle + result feed (`app/ai/summary.rs`), same
+    /// fire-and-forget contract as translation.
+    summary_service: SummaryService,
+    summary_rx: tokio::sync::broadcast::Receiver<SummaryEvent>,
     /// This session's translations for the current target language, keyed by
     /// message id. Cleared when the target language changes.
     pub(crate) translations: HashMap<Uuid, TranslationDisplay>,
@@ -714,7 +849,14 @@ pub struct ChatState {
     /// Mirrors of the profile's translation settings, synced by `App::tick`.
     translate_to: TranslateLang,
     auto_translate: bool,
+    /// The viewer's account timezone, synced by `App::tick`. `None` (unset or
+    /// unparseable) means every absolute time this pane writes stays UTC.
+    viewer_tz: Option<chrono_tz::Tz>,
     pub(crate) selected_message_id: Option<Uuid>,
+    /// Row-level viewport offset inside a selected message that wraps taller
+    /// than the chat pane; see [`SelectionScroll`]. Reset whenever the
+    /// selection lands on a different message.
+    pub(crate) selection_scroll: SelectionScroll,
     /// Armed by a first `d` press on a message; a second `d` on the same
     /// still-selected message confirms the delete. Any selection change or
     /// clear disarms it so a stale confirm can't reap the wrong message.
@@ -795,6 +937,8 @@ pub struct ChatState {
     requested_voice_command: Option<VoiceCommand>,
     /// Set by /golive; consumed by `App` (which owns the stream service).
     requested_golive: Option<GoLiveCommand>,
+    requested_crown: Option<CrownCommand>,
+    requested_pot: Option<PotCommand>,
     /// Set by /watch @user; consumed by `App`.
     requested_watch: Option<String>,
     /// A stream room this session just opened; consumed by `App`, which
@@ -830,6 +974,9 @@ pub struct ChatState {
     pub(crate) image_upload_rx: Option<tokio::sync::oneshot::Receiver<Result<String, String>>>,
     pub(crate) image_upload_pending: bool,
     pub(crate) image_upload_target_room_id: Option<Uuid>,
+    /// The reply the in-flight upload was composed against, handed back to the
+    /// composer when the URL lands.
+    image_upload_reply_target: Option<ReplyTarget>,
     pub(crate) requested_url_upload: Option<PendingUrlUpload>,
     requested_clipboard_image_upload: Option<PendingClipboardImageUpload>,
     pending_clipboard_image_upload: Option<PendingClipboardImageUpload>,
@@ -852,6 +999,49 @@ pub struct ChatState {
     pub(crate) last_image_upload_at: Option<std::time::Instant>,
 }
 
+/// Row-level scroll inside a selected message that wraps taller than the
+/// chat pane. Chat scroll is otherwise derived purely from message
+/// selection, which pins a too-tall message's top edge and leaves its
+/// bottom unreachable; this is the escape hatch `j`/`k` fall back to.
+///
+/// `rows` is how many rows past the message's pinned top the viewport
+/// starts; `overflow` is the renderer's measurement of how far `rows` can
+/// go (0 for a selection that fits the pane). Both are `Cell`s because the
+/// renderer writes them through the shared view's `&self`: it publishes
+/// `overflow` each frame and clamps `rows` back when a resize shrinks the
+/// range. Input reads the previous frame's measurement, the same one-frame
+/// contract as the history modal's `visible_rows`.
+#[derive(Default)]
+pub struct SelectionScroll {
+    pub(crate) rows: Cell<usize>,
+    pub(crate) overflow: Cell<usize>,
+}
+
+impl SelectionScroll {
+    fn reset(&self) {
+        self.rows.set(0);
+        self.overflow.set(0);
+    }
+
+    /// Apply a row delta against the last measured overflow. Returns whether
+    /// the viewport moved; `false` means that direction has nothing left to
+    /// reveal (or the selection fits the pane) and the caller should move
+    /// the selection instead.
+    fn step(&self, delta: isize) -> bool {
+        let overflow = self.overflow.get();
+        if overflow == 0 {
+            return false;
+        }
+        let current = self.rows.get();
+        let next = (current as isize + delta).clamp(0, overflow as isize) as usize;
+        if next == current {
+            return false;
+        }
+        self.rows.set(next);
+        true
+    }
+}
+
 /// What the UI knows about one message's translation into the session's
 /// target language. `Failed` renders nothing but lets `t` retry.
 /// `SameLanguage` renders nothing and sticks: the model already judged the
@@ -864,9 +1054,22 @@ pub enum TranslationDisplay {
     Failed,
 }
 
+/// The session identity a `ChatState` is built for: who is connected, under
+/// what name, with what rights.
+pub(crate) struct ChatSession {
+    pub user_id: Uuid,
+    pub username: String,
+    pub permissions: Permissions,
+    /// When you last left the app on this device (`user_ssh_keys.left_at`,
+    /// taken once at boot); `None` for a keyless session or a device with
+    /// no mark yet. See [`ChatState::device_left_at`].
+    pub device_left_at: Option<DateTime<Utc>>,
+}
+
 pub(crate) struct ChatServices {
     pub chat: ChatService,
     pub translation: crate::app::ai::translate::TranslationService,
+    pub summary: crate::app::ai::summary::SummaryService,
     pub notifications: NotificationService,
     pub articles: news::svc::ArticleService,
     pub feeds: feeds::svc::FeedService,
@@ -884,16 +1087,22 @@ impl Drop for ChatState {
 impl ChatState {
     pub(crate) fn new(
         services: ChatServices,
-        user_id: Uuid,
-        permissions: Permissions,
+        session: ChatSession,
         active_users: Option<ActiveUsers>,
         notifier: Notifier,
         mention_ladders: MentionLadders,
         files: Option<crate::config::FilesConfig>,
     ) -> Self {
+        let ChatSession {
+            user_id,
+            username,
+            permissions,
+            device_left_at,
+        } = session;
         let ChatServices {
             chat: service,
             translation: translation_service,
+            summary: summary_service,
             notifications: notification_service,
             articles: article_service,
             feeds: feed_service,
@@ -929,7 +1138,10 @@ impl ChatState {
             active_polls: HashMap::new(),
             lounge_room_id: None,
             activity_ticker: Vec::new(),
-            usernames: HashMap::new(),
+            // Seeded with the session's own name so self-referential features
+            // (the mention highlight, rendered-mention read stamps) work
+            // before the user has authored anything a payload would carry.
+            usernames: HashMap::from([(user_id, username)]),
             countries: HashMap::new(),
             ignored_user_ids: HashSet::new(),
             friend_user_ids: HashSet::new(),
@@ -937,14 +1149,17 @@ impl ChatState {
             room_owner_ids: HashMap::new(),
             username_rx,
             overlay: None,
+            pending_summary_overlay: None,
             news_modal: None,
             image_modal: None,
             image_modal_capacity: None,
             pending_reaction_owners_message_id: None,
             unread_counts: HashMap::new(),
-            room_unread_markers: HashMap::new(),
+            afk_lines: HashMap::new(),
+            device_left_at,
             pending_read_rooms: HashSet::new(),
             pending_read_flush: PendingReadCursorFlush::default(),
+            mention_reads_sent: HashSet::new(),
             sticky_unread_dm: None,
             visible_room_id: None,
             room_tx,
@@ -969,16 +1184,21 @@ impl ChatState {
             chat_badges: HashMap::new(),
             profile_award_badges: HashMap::new(),
             message_reactions: HashMap::new(),
+            message_gilds: HashMap::new(),
             voice_channels_by_room_id: HashMap::new(),
             translation_rx: translation_service.subscribe(),
             translation_service,
+            summary_rx: summary_service.subscribe(),
+            summary_service,
             translations: HashMap::new(),
             translation_hidden: HashSet::new(),
             translation_manual: HashSet::new(),
             translation_cache_checked: HashSet::new(),
             translate_to: TranslateLang::En,
             auto_translate: false,
+            viewer_tz: None,
             selected_message_id: None,
+            selection_scroll: SelectionScroll::default(),
             pending_delete_message_id: None,
             reaction_leader_active: false,
             highlighted_message_id: None,
@@ -1029,6 +1249,8 @@ impl ChatState {
             requested_quit: false,
             requested_voice_command: None,
             requested_golive: None,
+            requested_crown: None,
+            requested_pot: None,
             requested_watch: None,
             opened_stream_room: None,
             requested_aquarium_command: None,
@@ -1046,6 +1268,7 @@ impl ChatState {
             image_upload_rx: None,
             image_upload_pending: false,
             image_upload_target_room_id: None,
+            image_upload_reply_target: None,
             requested_url_upload: None,
             requested_clipboard_image_upload: None,
             pending_clipboard_image_upload: None,
@@ -1091,6 +1314,7 @@ impl ChatState {
         self.composing = true;
         self.composer_room_id = Some(room_id);
         self.selected_message_id = None;
+        self.selection_scroll.reset();
         self.reply_target = None;
         self.edited_message_id = None;
         composer::set_themed_textarea_cursor_visible(&mut self.composer, true);
@@ -1167,6 +1391,44 @@ impl ChatState {
         self.pending_read_flush.queue(room_id, Instant::now());
     }
 
+    /// Place the AFK line for the room on screen once this session's
+    /// keyboard has been quiet for [`AFK_LINE_IDLE`]. `idle` is how long ago
+    /// the last input landed, mirrored from `App` the same way `viewer_tz`
+    /// is. Reports whether the line moved, since that is render-visible.
+    ///
+    /// Only the visible room can collect a line: a room you are not looking
+    /// at was never being attended, and its rail badge already says what is
+    /// waiting. A room that already holds a line keeps the one it has, so
+    /// the line marks when you went quiet and does not slide forward while
+    /// you stay away.
+    pub(crate) fn sync_afk_line(&mut self, idle: Duration) -> bool {
+        if idle < AFK_LINE_IDLE {
+            return false;
+        }
+        let Some(room_id) = self.visible_room_id else {
+            return false;
+        };
+        if self.afk_lines.contains_key(&room_id) {
+            return false;
+        }
+        let Ok(idle) = chrono::Duration::from_std(idle) else {
+            return false;
+        };
+        self.afk_lines.insert(room_id, Utc::now() - idle);
+        self.bump_room_version(room_id);
+        true
+    }
+
+    /// Drop the room's AFK line: this reader is in the conversation again.
+    ///
+    /// One caller, and it is an act the reader performed rather than a state
+    /// we inferred: a message of theirs landing in the room.
+    fn clear_afk_line(&mut self, room_id: Uuid) {
+        if self.afk_lines.remove(&room_id).is_some() {
+            self.bump_room_version(room_id);
+        }
+    }
+
     /// Remember the DM being read so the promoted unread-DMs group can hold it
     /// in place. Reading is what zeroes the unread count, so this runs before
     /// the count is cleared.
@@ -1215,6 +1477,11 @@ impl ChatState {
     /// Sync the profile's translation settings into this session. Called from
     /// `App::tick`; a target change drops every per-message translation state
     /// (it all describes the old language) and invalidates row caches.
+    /// Mirror the account timezone the summary overlay dates its window in.
+    pub(crate) fn set_viewer_tz(&mut self, timezone: Option<chrono_tz::Tz>) {
+        self.viewer_tz = timezone;
+    }
+
     pub fn set_translate_settings(&mut self, target: TranslateLang, auto: bool) -> bool {
         let mut changed = false;
         if self.translate_to != target {
@@ -1405,6 +1672,113 @@ impl ChatState {
         banner
     }
 
+    /// Drain `/summary` results. A ready summary opens the shared overlay
+    /// (the `/rules` surface); when another overlay is already up it waits
+    /// in `pending_summary_overlay` instead of clobbering it, and takes the
+    /// surface here as soon as it frees. Every other outcome banners. The
+    /// broadcast carries all users' results, so foreign events are dropped.
+    /// Returns the banner plus whether a waiting summary was promoted (a
+    /// render-visible change `tick` cannot see from the queues).
+    fn drain_summary_events(&mut self) -> (Option<Banner>, bool) {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let mut promoted = false;
+        if self.overlay.is_none()
+            && let Some(overlay) = self.pending_summary_overlay.take()
+        {
+            self.overlay = Some(overlay);
+            promoted = true;
+        }
+        let mut banner = None;
+        loop {
+            let event = match self.summary_rx.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+            };
+            if event.user_id != self.user_id {
+                continue;
+            }
+            match event.outcome {
+                SummaryOutcome::Ready {
+                    text,
+                    message_count,
+                    since,
+                    basis,
+                    capped,
+                    truncated,
+                } => {
+                    let plural = if message_count == 1 { "" } else { "s" };
+                    let stamp = crate::app::common::time::instant_for_viewer(since, self.viewer_tz);
+                    // Every arm names where the window came from, because
+                    // "since you left" and "the last 24h" are different
+                    // claims and the reader has to be able to tell which
+                    // one they got. A capped window says so rather than
+                    // presenting the cap as the moment they left.
+                    let mut head = match basis {
+                        SummaryBasis::LeftApp => {
+                            format!("{message_count} message{plural} since you left · {stamp}")
+                        }
+                        SummaryBasis::Default => format!(
+                            "{message_count} message{plural} since {stamp} · the last {}h",
+                            crate::app::ai::summary::SUMMARY_DEFAULT_WINDOW_HOURS
+                        ),
+                        SummaryBasis::Explicit => {
+                            format!("{message_count} message{plural} since {stamp}")
+                        }
+                    };
+                    if capped {
+                        head.push_str(&format!(
+                            " · capped at {}h",
+                            crate::app::ai::summary::SUMMARY_MAX_WINDOW_HOURS
+                        ));
+                    }
+                    if truncated {
+                        head.push_str(" · older messages past the cap left out");
+                    }
+                    let mut lines = vec![head, String::new()];
+                    lines.extend(text.lines().map(str::to_string));
+                    let overlay = Overlay::new(format!("{} catch-up", event.room_label), lines);
+                    match self.overlay {
+                        // An overlay the user is reading is not clobbered
+                        // by an async result; the summary waits its turn.
+                        Some(_) => {
+                            self.pending_summary_overlay = Some(overlay);
+                            banner =
+                                Some(Banner::info("Summary ready, close the open panel to view"));
+                        }
+                        None => self.overlay = Some(overlay),
+                    }
+                }
+                SummaryOutcome::Empty { basis } => {
+                    banner = Some(Banner::info(match basis {
+                        SummaryBasis::LeftApp => "Nothing new since you left",
+                        SummaryBasis::Default => "Nothing said in the last 24h",
+                        SummaryBasis::Explicit => "Nothing said in that window",
+                    }));
+                }
+                SummaryOutcome::InFlight => {
+                    banner = Some(Banner::info("Summary already running"));
+                }
+                SummaryOutcome::Cooldown { remaining } => {
+                    let minutes = remaining.as_secs().div_ceil(60).max(1);
+                    banner = Some(Banner::info(&format!(
+                        "Summary cooling down, try again in {minutes}m"
+                    )));
+                }
+                SummaryOutcome::CapExhausted => {
+                    banner = Some(Banner::error("Summaries hit today's cap, back tomorrow"));
+                }
+                SummaryOutcome::Unavailable => {
+                    banner = Some(Banner::error("Summaries are not available here"));
+                }
+                SummaryOutcome::Failed => {
+                    banner = Some(Banner::error("Summary failed, try again"));
+                }
+            }
+        }
+        (banner, promoted)
+    }
+
     fn flush_pending_read_cursors(&mut self) {
         let room_ids = self.pending_read_flush.take_all();
         self.flush_read_cursors(room_ids);
@@ -1415,10 +1789,50 @@ impl ChatState {
         self.flush_read_cursors(room_ids);
     }
 
-    fn flush_read_cursors(&self, room_ids: Vec<Uuid>) {
-        for room_id in room_ids {
-            self.service.mark_room_read_task(self.user_id, room_id);
+    fn flush_read_cursors(&mut self, room_ids: Vec<Uuid>) {
+        for room_id in &room_ids {
+            self.service.mark_room_read_task(self.user_id, *room_id);
         }
+        self.flush_rendered_mention_reads(&room_ids);
+    }
+
+    /// Report mentions of this user whose messages are actually loaded in the
+    /// rooms being marked read, so their rail-badge entries clear. This is
+    /// deliberately narrower than the room's own read cursor: a mention
+    /// sitting above the loaded tail was never on screen and stays unread.
+    /// Runs on the same debounced flush as the cursors; every event that can
+    /// surface a mention (tail landing, a live message, the room becoming
+    /// visible) re-queues the room, so nothing is missed by collecting here.
+    fn flush_rendered_mention_reads(&mut self, room_ids: &[Uuid]) {
+        let username_lower = self
+            .usernames
+            .get(&self.user_id)
+            .map(|username| username.to_ascii_lowercase());
+        let Some(username_lower) = username_lower else {
+            return;
+        };
+        let mut rendered: Vec<Uuid> = Vec::new();
+        for room_id in room_ids {
+            let Some((_, messages)) = self.rooms.iter().find(|(room, _)| room.id == *room_id)
+            else {
+                continue;
+            };
+            rendered.extend(
+                messages
+                    .iter()
+                    .filter(|message| {
+                        message.user_id != self.user_id
+                            && !self.mention_reads_sent.contains(&message.id)
+                            && mentions::mentions_user(&message.body, Some(&username_lower))
+                    })
+                    .map(|message| message.id),
+            );
+        }
+        if rendered.is_empty() {
+            return;
+        }
+        self.mention_reads_sent.extend(rendered.iter().copied());
+        self.notifications.mark_read_for_messages(rendered);
     }
 
     /// Returns visible messages for the given room.
@@ -1588,6 +2002,14 @@ impl ChatState {
         self.requested_golive.take()
     }
 
+    pub(crate) fn take_requested_crown(&mut self) -> Option<CrownCommand> {
+        self.requested_crown.take()
+    }
+
+    pub(crate) fn take_requested_pot(&mut self) -> Option<PotCommand> {
+        self.requested_pot.take()
+    }
+
     pub(crate) fn take_requested_watch(&mut self) -> Option<String> {
         self.requested_watch.take()
     }
@@ -1703,6 +2125,7 @@ impl ChatState {
         self.pending_delete_message_id = None;
         if ids.is_empty() {
             self.selected_message_id = None;
+            self.selection_scroll.reset();
             return;
         }
 
@@ -1717,7 +2140,24 @@ impl ChatState {
             None => 0,
         };
 
+        // A clamped move that stays on the same message keeps its row
+        // offset; landing anywhere else starts reading from the top again.
+        if self.selected_message_id != Some(ids[new_idx]) {
+            self.selection_scroll.reset();
+        }
         self.selected_message_id = Some(ids[new_idx]);
+    }
+
+    /// Scroll by rows inside the selected message when it wraps taller than
+    /// the chat pane. Positive walks toward the message's end, negative back
+    /// toward its top. Returns whether the viewport moved; `false` means
+    /// there is nothing left to reveal in that direction and the caller
+    /// should move the selection instead. The overflow measurement is the
+    /// previous frame's, so a fresh selection reads 0 until it has rendered
+    /// once; a held-down key therefore skims across messages instead of
+    /// getting stuck inside every long one.
+    pub(crate) fn scroll_selected_message_rows(&mut self, delta: isize) -> bool {
+        self.selected_message_id.is_some() && self.selection_scroll.step(delta)
     }
 
     /// Move message cursor by delta. Positive = toward older, negative = toward newer.
@@ -1736,11 +2176,13 @@ impl ChatState {
         self.reaction_leader_active = false;
         self.pending_delete_message_id = None;
         self.selected_message_id = None;
+        self.selection_scroll.reset();
     }
 
     pub fn focus_message_in_room(&mut self, room_id: Uuid, message_id: Uuid) {
         self.reaction_leader_active = false;
         self.pending_delete_message_id = None;
+        self.selection_scroll.reset();
         // Every synthetic entry drops, the open cyberspace room included: a
         // jump lands on a real room, and a room nobody is looking at must not
         // keep its stream and heartbeat running.
@@ -1900,6 +2342,7 @@ impl ChatState {
             .iter()
             .find(|(room, _)| room.id == room_id)
             .and_then(|(_, msgs)| adjacent_message_id(msgs, selected_id));
+        self.selection_scroll.reset();
         Some(Banner::success("Deleting message..."))
     }
 
@@ -1972,6 +2415,9 @@ impl ChatState {
         self.highlighted_message_id = None;
         self.pending_delete_message_id = None;
         let changed = self.selected_message_id != Some(message_id);
+        if changed {
+            self.selection_scroll.reset();
+        }
         self.selected_message_id = Some(message_id);
         changed
     }
@@ -2004,11 +2450,16 @@ impl ChatState {
     }
 
     /// Open the history modal at a room's newest messages (the `/history`
-    /// path).
+    /// path for a caught-up room).
     pub(crate) fn open_history_at_tail(&mut self, room_id: Uuid) {
         let request_id = Uuid::now_v7();
-        self.history_modal
-            .open_at_tail(room_id, self.history_room_label(room_id), request_id);
+        self.history_modal.open_at_tail(
+            room_id,
+            self.history_room_label(room_id),
+            request_id,
+            self.user_id,
+            self.history_unread_cutoff(room_id),
+        );
         let exclude_user_ids: Vec<Uuid> = self.ignored_user_ids.iter().copied().collect();
         self.service.load_history_page_task(
             self.user_id,
@@ -2030,6 +2481,8 @@ impl ChatState {
             self.history_room_label(room_id),
             message_id,
             request_id,
+            self.user_id,
+            self.history_unread_cutoff(room_id),
         );
         let exclude_user_ids: Vec<Uuid> = self.ignored_user_ids.iter().copied().collect();
         self.service.load_history_anchor_task(
@@ -2038,6 +2491,41 @@ impl ChatState {
             message_id,
             exclude_user_ids,
         );
+    }
+
+    /// Open the history modal at the room's first unread message (the
+    /// `/history` path while the unread marker is set). The service resolves
+    /// the exact first unread even when it sits further back than the live
+    /// tail's 500; a room with nothing unread server-side falls back to a
+    /// plain tail page under the same request id.
+    pub(crate) fn open_history_at_unread(&mut self, room_id: Uuid, cutoff: DateTime<Utc>) {
+        let request_id = Uuid::now_v7();
+        self.history_modal.open_at_unread(
+            room_id,
+            self.history_room_label(room_id),
+            request_id,
+            self.user_id,
+            Some(cutoff),
+        );
+        let exclude_user_ids: Vec<Uuid> = self.ignored_user_ids.iter().copied().collect();
+        self.service.load_history_unread_task(
+            self.user_id,
+            request_id,
+            room_id,
+            cutoff,
+            exclude_user_ids,
+        );
+    }
+
+    /// The unread cutoff the history modal's divider draws against: this
+    /// session's AFK line for the room. No line (you never stepped away, or
+    /// you have caught up since) yields no divider, mirroring the live tail.
+    ///
+    /// `/history` only reads the line, never clears it: opening scrollback
+    /// is how you go and look at the backlog, not proof you got through it,
+    /// and the anchor should still be there when you close the modal.
+    fn history_unread_cutoff(&self, room_id: Uuid) -> Option<DateTime<Utc>> {
+        self.afk_lines.get(&room_id).copied()
     }
 
     /// Title for the history modal. A public-room mention can point at a room
@@ -2189,6 +2677,49 @@ impl ChatState {
         self.service
             .toggle_message_reaction_task(self.user_id, message.id, icon);
         None
+    }
+
+    /// What the gild picker needs about the selected message, or the refusal
+    /// the service would answer with anyway. The picker never opens on a
+    /// message that could only be refused: your own message, one in a DM or
+    /// private room, or one in a game or stream chat. Only the rules a room
+    /// list can answer live here; the rest (membership, bots, cooldown,
+    /// balance) stay with the service.
+    pub(crate) fn gild_target_in_room(&self, room_id: Uuid) -> Result<GildTarget, GildRefusal> {
+        let Some(message) = self.selected_message_in_room(room_id) else {
+            return Err(GildRefusal::MessageNotFound);
+        };
+        let Some(room) = self.room_by_id(room_id) else {
+            return Err(GildRefusal::MessageNotFound);
+        };
+        if room.visibility != "public" {
+            return Err(GildRefusal::NotPublic);
+        }
+        if room.kind == "game" {
+            return Err(GildRefusal::GameRoom);
+        }
+        if message.user_id == self.user_id {
+            return Err(GildRefusal::SelfGild);
+        }
+        Ok(GildTarget {
+            message_id: message.id,
+            author_username: self.username_for(message.user_id),
+            // One line, always: the picker prints the preview in a single
+            // row, and a multi-line body would otherwise walk over the
+            // tier rows below it.
+            preview: message
+                .body
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        })
+    }
+
+    /// Ask the service to buy a gild. Fire and forget: the answer arrives as
+    /// a banner, and the marker arrives as a repaint.
+    pub fn gild_message(&self, message_id: Uuid, tier: GildTier) {
+        self.service
+            .gild_message_task(self.user_id, message_id, tier);
     }
 
     fn find_message_in_room(&self, room_id: Uuid, message_id: Uuid) -> Option<&ChatMessage> {
@@ -2430,6 +2961,7 @@ impl ChatState {
 
     pub(crate) fn select_room_slot(&mut self, slot: RoomSlot) -> bool {
         self.selected_message_id = None;
+        self.selection_scroll.reset();
         self.reaction_leader_active = false;
         self.highlighted_message_id = None;
 
@@ -2667,12 +3199,43 @@ impl ChatState {
         ));
     }
 
-    fn reaction_owner_lines(&self, owners: &[ChatMessageReactionOwners]) -> Vec<String> {
-        if owners.is_empty() {
+    /// The `ff` overlay: gilds first, one block per tier held (best tier
+    /// first, since that is what the buyers paid for), then one block per
+    /// reaction icon. Gilds are per buyer, so a tier block's names are the
+    /// people holding exactly that tier on this message.
+    fn reaction_owner_lines(
+        &self,
+        gilds: &[ChatMessageGild],
+        owners: &[ChatMessageReactionOwners],
+    ) -> Vec<String> {
+        if gilds.is_empty() && owners.is_empty() {
             return vec!["No reactions yet".to_string()];
         }
 
         let mut lines = Vec::new();
+        for tier in GildTier::ALL.iter().rev() {
+            let buyers: Vec<Uuid> = gilds
+                .iter()
+                .filter(|gild| gild.tier == *tier)
+                .map(|gild| gild.user_id)
+                .collect();
+            if buyers.is_empty() {
+                continue;
+            }
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            let count = buyers.len();
+            let noun = if count == 1 { "gild" } else { "gilds" };
+            lines.push(format!(
+                "{} {} {} {}",
+                tier.marker(),
+                count,
+                tier.label(),
+                noun
+            ));
+            lines.extend(self.owner_name_rows(&buyers));
+        }
         for reaction in owners {
             if !lines.is_empty() {
                 lines.push(String::new());
@@ -2685,31 +3248,35 @@ impl ChatState {
                 lines.push("  unknown".to_string());
                 continue;
             }
-            let mut labels: Vec<String> = reaction
-                .user_ids
-                .iter()
-                .take(REACTION_OWNER_DISPLAY_LIMIT)
-                .map(|user_id| {
-                    self.usernames
-                        .get(user_id)
-                        .map(|name| name.trim())
-                        .filter(|name| !name.is_empty())
-                        .map(|name| format!("@{name}"))
-                        .unwrap_or_else(|| format!("@<unknown:{}>", short_user_id(*user_id)))
-                })
-                .collect();
-            let hidden_count = reaction
-                .user_ids
-                .len()
-                .saturating_sub(REACTION_OWNER_DISPLAY_LIMIT);
-            if hidden_count > 0 {
-                labels.push(format!("[+{hidden_count} more]"));
-            }
-            for row in labels.chunks(REACTION_OWNER_COLUMNS) {
-                lines.push(format!("  {}", row.join(" ")));
-            }
+            lines.extend(self.owner_name_rows(&reaction.user_ids));
         }
         lines
+    }
+
+    /// `@name` labels for one block of the `ff` overlay, capped at
+    /// `REACTION_OWNER_DISPLAY_LIMIT` with a `[+N more]` tail, wrapped
+    /// `REACTION_OWNER_COLUMNS` per row.
+    fn owner_name_rows(&self, user_ids: &[Uuid]) -> Vec<String> {
+        let mut labels: Vec<String> = user_ids
+            .iter()
+            .take(REACTION_OWNER_DISPLAY_LIMIT)
+            .map(|user_id| {
+                self.usernames
+                    .get(user_id)
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map(|name| format!("@{name}"))
+                    .unwrap_or_else(|| format!("@<unknown:{}>", short_user_id(*user_id)))
+            })
+            .collect();
+        let hidden_count = user_ids.len().saturating_sub(REACTION_OWNER_DISPLAY_LIMIT);
+        if hidden_count > 0 {
+            labels.push(format!("[+{hidden_count} more]"));
+        }
+        labels
+            .chunks(REACTION_OWNER_COLUMNS)
+            .map(|row| format!("  {}", row.join(" ")))
+            .collect()
     }
 
     fn ignore_list_lines(&self) -> Vec<String> {
@@ -2883,12 +3450,66 @@ impl ChatState {
             return None;
         }
 
+        if let Some(rest) = body.trim().strip_prefix("/summary")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.clear_composer_after_submit();
+            let Some(room_id) = self.visible_room_id else {
+                return Some(Banner::error("open a room first"));
+            };
+            let Some((room, _)) = self.rooms.iter().find(|(room, _)| room.id == room_id) else {
+                return Some(Banner::error("open a room first"));
+            };
+            // Public rooms only, checked again in the SQL; this one is for
+            // an immediate, honest banner.
+            if room.visibility != "public" {
+                return Some(Banner::error("Summaries cover public rooms only"));
+            }
+            let window = match parse_summary_arg(rest) {
+                // Always the device mark, never the room's AFK line: the
+                // catch-up answers "what happened since I was last here",
+                // and here is this device. The service only clamps it.
+                SummaryArg::CatchUp => catch_up_window(self.device_left_at),
+                SummaryArg::Window(back) => SummaryWindow::Explicit(back),
+                SummaryArg::Unparseable => {
+                    return Some(Banner::error("Use /summary, or a window like /summary 6h"));
+                }
+                SummaryArg::TooShort => {
+                    return Some(Banner::error("Summary windows start at 1m"));
+                }
+                SummaryArg::TooLong => {
+                    return Some(Banner::error(&format!(
+                        "Summaries reach back at most {}h",
+                        crate::app::ai::summary::SUMMARY_MAX_WINDOW_HOURS
+                    )));
+                }
+            };
+            let exclude_user_ids: Vec<Uuid> = self.ignored_user_ids.iter().copied().collect();
+            self.summary_service.request(
+                self.user_id,
+                room_id,
+                self.history_room_label(room_id),
+                window,
+                exclude_user_ids,
+            );
+            // The line stays: the summary says what is below it, it does
+            // not move where it is. Only speaking in the room does that.
+            return Some(Banner::info("Summarizing…"));
+        }
+
         if body.trim() == "/history" {
             self.clear_composer_after_submit();
             let Some(room_id) = self.visible_room_id else {
                 return Some(Banner::error("open a room first"));
             };
-            self.open_history_at_tail(room_id);
+            // With unread messages waiting, land on the first of them
+            // instead of the tail; the cutoff is the session's pre-mark
+            // unread marker, since the server cursor advanced the moment
+            // the room was opened.
+            match self.history_unread_cutoff(room_id) {
+                Some(cutoff) => self.open_history_at_unread(room_id, cutoff),
+                None => self.open_history_at_tail(room_id),
+            }
             return None;
         }
 
@@ -2908,6 +3529,27 @@ impl ChatState {
         if let Some(parsed) = parse_golive_command(&body) {
             self.clear_composer_after_submit();
             self.requested_golive = Some(parsed);
+            return None;
+        }
+
+        if let Some(parsed) = parse_crown_command(&body) {
+            self.clear_composer_after_submit();
+            let Some(command) = parsed else {
+                return Some(Banner::error("Usage: /crown, or /crown take"));
+            };
+            self.requested_crown = Some(command);
+            return None;
+        }
+
+        if let Some(parsed) = parse_pot_command(&body) {
+            self.clear_composer_after_submit();
+            let Some(command) = parsed else {
+                return Some(Banner::error(&format!(
+                    "Usage: /pot, or /pot buy N (1 to {})",
+                    late_core::models::pot::POT_MAX_TICKETS_PER_DAY
+                )));
+            };
+            self.requested_pot = Some(command);
             return None;
         }
 
@@ -3076,8 +3718,13 @@ impl ChatState {
                 return Some(Banner::error("File uploads are disabled"));
             }
             let room_id = self.upload_target_room_id();
+            let reply_target = self.reply_target.clone();
             self.clear_composer_after_submit();
-            self.requested_url_upload = Some(PendingUrlUpload { url, room_id });
+            self.requested_url_upload = Some(PendingUrlUpload {
+                url,
+                room_id,
+                reply_target,
+            });
             return None;
         }
 
@@ -3094,8 +3741,10 @@ impl ChatState {
                 ));
             }
             let room_id = self.upload_target_room_id();
+            let reply_target = self.reply_target.clone();
             self.clear_composer_after_submit();
-            self.requested_clipboard_image_upload = Some(PendingClipboardImageUpload::new(room_id));
+            self.requested_clipboard_image_upload =
+                Some(PendingClipboardImageUpload::new(room_id, reply_target));
             return None;
         }
 
@@ -3770,14 +4419,21 @@ impl ChatState {
         self.composer.input(input);
     }
 
+    /// Upload bytes that arrived while the composer is still open (a terminal
+    /// image paste), so whatever reply it was aiming at is still live here.
     pub fn start_image_upload(&mut self, bytes: Vec<u8>) -> Option<Banner> {
-        self.start_image_upload_in_room(bytes, self.upload_target_room_id())
+        self.start_image_upload_in_room(
+            bytes,
+            self.upload_target_room_id(),
+            self.reply_target.clone(),
+        )
     }
 
     pub(crate) fn start_image_upload_in_room(
         &mut self,
         bytes: Vec<u8>,
         room_id: Option<Uuid>,
+        reply_target: Option<ReplyTarget>,
     ) -> Option<Banner> {
         let Some(mime) = crate::app::files::image_upload::detect_image_mime(&bytes) else {
             return Some(Banner::error("Unsupported image type"));
@@ -3787,7 +4443,7 @@ impl ChatState {
         };
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if let Some(banner) = self.begin_image_upload(room_id, rx) {
+        if let Some(banner) = self.begin_image_upload(room_id, reply_target, rx) {
             return Some(banner);
         }
         let mime = mime.to_string();
@@ -3817,6 +4473,7 @@ impl ChatState {
     pub(crate) fn begin_image_upload(
         &mut self,
         room_id: Option<Uuid>,
+        reply_target: Option<ReplyTarget>,
         rx: tokio::sync::oneshot::Receiver<Result<String, String>>,
     ) -> Option<Banner> {
         if self.image_upload_pending {
@@ -3837,12 +4494,24 @@ impl ChatState {
         self.image_upload_rx = Some(rx);
         self.image_upload_pending = true;
         self.image_upload_target_room_id = room_id;
+        self.image_upload_reply_target = reply_target;
         self.last_image_upload_at = Some(std::time::Instant::now());
         None
     }
 
     pub(crate) fn take_image_upload_target_room_id(&mut self) -> Option<Uuid> {
         self.image_upload_target_room_id.take()
+    }
+
+    /// Put the finished upload's reply back on the composer. Reopening the
+    /// composer with the URL goes through `start_composing_in_room`, which
+    /// drops the reply target, so this runs after it.
+    pub(crate) fn restore_image_upload_reply_target(&mut self) {
+        self.reply_target = self.image_upload_reply_target.take();
+    }
+
+    pub(crate) fn clear_image_upload_reply_target(&mut self) {
+        self.image_upload_reply_target = None;
     }
 
     pub(crate) fn take_requested_url_upload(&mut self) -> Option<PendingUrlUpload> {
@@ -3855,8 +4524,13 @@ impl ChatState {
         self.requested_clipboard_image_upload.take()
     }
 
-    pub(crate) fn begin_pending_clipboard_image_upload(&mut self, room_id: Option<Uuid>) {
-        self.pending_clipboard_image_upload = Some(PendingClipboardImageUpload::new(room_id));
+    pub(crate) fn begin_pending_clipboard_image_upload(
+        &mut self,
+        room_id: Option<Uuid>,
+        reply_target: Option<ReplyTarget>,
+    ) {
+        self.pending_clipboard_image_upload =
+            Some(PendingClipboardImageUpload::new(room_id, reply_target));
     }
 
     pub(crate) fn take_pending_clipboard_image_upload(
@@ -4148,11 +4822,13 @@ impl ChatState {
             || !self.targeted_event_rx.is_empty()
             || !self.event_rx.is_empty()
             || !self.moderation_event_rx.is_empty()
-            || !self.translation_rx.is_empty();
+            || !self.translation_rx.is_empty()
+            || !self.summary_rx.is_empty();
         self.drain_username_directory();
         let changed = self.drain_snapshot() || changed;
         let banner = self.drain_events();
         let translation_banner = self.drain_translation_events();
+        let (summary_banner, summary_overlay_promoted) = self.drain_summary_events();
         let moderation_banner = self.drain_moderation_events();
         let feeds_tick = self.feeds.tick();
         let news_tick = self.news.tick();
@@ -4223,6 +4899,7 @@ impl ChatState {
         let banner = moderation_banner
             .or(banner)
             .or(translation_banner)
+            .or(summary_banner)
             .or(feeds_tick.banner)
             .or(news_tick.banner)
             .or(notif_tick.banner)
@@ -4232,6 +4909,7 @@ impl ChatState {
         ChatTick {
             banner,
             changed: changed
+                || summary_overlay_promoted
                 || feeds_tick.changed
                 || news_tick.changed
                 || notif_tick.changed
@@ -4261,6 +4939,7 @@ impl ChatState {
         self.showcase_selected = false;
         self.work_selected = false;
         self.selected_message_id = None;
+        self.selection_scroll.reset();
         self.highlighted_message_id = None;
     }
 
@@ -4690,6 +5369,10 @@ impl ChatState {
         &self.message_reactions
     }
 
+    pub fn message_gilds(&self) -> &HashMap<Uuid, ChatMessageGildSummary> {
+        &self.message_gilds
+    }
+
     /// Returns true when applying the snapshot changed anything
     /// render-visible. Snapshots arrive on a fixed cadence whether or not
     /// anything changed, so every write below detects real change before
@@ -4980,9 +5663,9 @@ impl ChatState {
                 ChatEvent::RoomTailLoaded {
                     user_id,
                     room_id,
-                    last_read_at,
                     messages,
                     message_reactions,
+                    message_gilds,
                     usernames,
                     bonsai_glyphs,
                     chat_badges,
@@ -5011,14 +5694,6 @@ impl ChatState {
                     if context_changed {
                         self.context_epoch += 1;
                     }
-                    if messages.iter().any(|message| {
-                        last_read_at.is_none_or(|read_at| message.created > read_at)
-                            && message.user_id != self.user_id
-                    }) {
-                        self.room_unread_markers.insert(room_id, last_read_at);
-                    } else {
-                        self.room_unread_markers.remove(&room_id);
-                    }
                     self.merge_room_tail(room_id, messages);
                     let mut reactions_changed = false;
                     for (message_id, reactions) in message_reactions {
@@ -5030,7 +5705,17 @@ impl ChatState {
                             }
                         }
                     }
-                    if reactions_changed {
+                    let mut gilds_changed = false;
+                    for (message_id, gild) in message_gilds {
+                        match self.message_gilds.get(&message_id) {
+                            Some(existing) if *existing == gild => {}
+                            _ => {
+                                self.message_gilds.insert(message_id, gild);
+                                gilds_changed = true;
+                            }
+                        }
+                    }
+                    if reactions_changed || gilds_changed {
                         self.bump_room_version(room_id);
                     }
                     if self.visible_room_id == Some(room_id) {
@@ -5340,6 +6025,52 @@ impl ChatState {
                     self.message_reactions.insert(message_id, reactions);
                     self.bump_room_version(room_id);
                 }
+                ChatEvent::MessageGildsUpdated {
+                    room_id,
+                    message_id,
+                    summary,
+                } => {
+                    // Gilds only exist in public rooms, so there is no
+                    // audience to filter: what one viewer of the room sees,
+                    // every viewer sees.
+                    match summary {
+                        Some(summary) => {
+                            self.message_gilds.insert(message_id, summary);
+                        }
+                        None => {
+                            self.message_gilds.remove(&message_id);
+                        }
+                    }
+                    self.bump_room_version(room_id);
+                }
+                ChatEvent::GildSucceeded {
+                    user_id,
+                    tier,
+                    buyer_balance,
+                    ..
+                } if self.user_id == user_id => {
+                    banner = Some(Banner::success(&format!(
+                        "Gilded {} for {} chips ({buyer_balance} left)",
+                        tier.label(),
+                        tier.price()
+                    )));
+                }
+                ChatEvent::GildSucceeded {
+                    author_user_id,
+                    tier,
+                    buyer_username,
+                    author_balance,
+                    ..
+                } if self.user_id == author_user_id => {
+                    banner = Some(Banner::success(&format!(
+                        "@{buyer_username} gilded your message {} (+{} chips, balance {author_balance})",
+                        tier.marker(),
+                        tier.author_share()
+                    )));
+                }
+                ChatEvent::GildFailed { user_id, message } if self.user_id == user_id => {
+                    banner = Some(Banner::error(&message));
+                }
                 ChatEvent::EditSucceeded {
                     user_id,
                     request_id,
@@ -5463,6 +6194,7 @@ impl ChatState {
                 ChatEvent::ReactionOwnersListed {
                     user_id,
                     message_id,
+                    gilds,
                     owners,
                     usernames,
                 } if self.user_id == user_id
@@ -5470,7 +6202,7 @@ impl ChatState {
                 {
                     self.pending_reaction_owners_message_id = None;
                     self.extend_usernames(usernames);
-                    let lines = self.reaction_owner_lines(&owners);
+                    let lines = self.reaction_owner_lines(&gilds, &owners);
                     self.overlay = Some(Overlay::dismissible("Reactions", lines));
                 }
                 ChatEvent::ReactionOwnersListFailed { user_id, message }
@@ -5612,6 +6344,16 @@ impl ChatState {
             return;
         }
 
+        // Speaking in a room clears its AFK line: you are in the conversation
+        // now, whatever the keyboard was doing before. Done on the message
+        // landing rather than at each of the several submit paths (`/me`,
+        // `/roll`, `/cup`, a plain line) so there is one place to look, and
+        // it is the authoritative one: the line goes when the message that
+        // ends the silence actually exists.
+        if message.user_id == self.user_id {
+            self.clear_afk_line(room_id);
+        }
+
         let is_viewing_room = Some(room_id) == self.visible_room_id;
         if self.message_is_ignored(&message) {
             if is_viewing_room {
@@ -5641,6 +6383,7 @@ impl ChatState {
             messages.truncate(500);
             for message_id in removed_ids {
                 self.message_reactions.remove(&message_id);
+                self.message_gilds.remove(&message_id);
                 // Evicted messages can never render again this session, so
                 // their translation state is dead weight; without this a
                 // long-lived auto-translate session grows unbounded.
@@ -5665,6 +6408,11 @@ impl ChatState {
             changed = messages.len() != before;
         }
         if self.message_reactions.remove(&message_id).is_some() {
+            changed = true;
+        }
+        // The gild rows went with the message (`ON DELETE CASCADE`), so the
+        // marker must go too.
+        if self.message_gilds.remove(&message_id).is_some() {
             changed = true;
         }
         self.forget_translation(message_id);
@@ -7348,6 +8096,61 @@ fn parse_room_ban_command<'a>(
 fn short_user_id(user_id: Uuid) -> String {
     let id = user_id.to_string();
     id[..id.len().min(8)].to_string()
+}
+
+/// The window a bare `/summary` opens: from when you last left the app on
+/// this device, or the default when the device has no mark. The room's AFK
+/// line is deliberately not an input; see [`ChatState::device_left_at`].
+fn catch_up_window(device_left_at: Option<DateTime<Utc>>) -> SummaryWindow {
+    match device_left_at {
+        Some(left_at) => SummaryWindow::SinceLeftApp(left_at),
+        None => SummaryWindow::Default,
+    }
+}
+
+/// What the text after `/summary` asked for. Every outcome is named so the
+/// command's match answers each one with its own banner: a typo must never
+/// silently become the default window.
+#[derive(Debug, PartialEq, Eq)]
+enum SummaryArg {
+    /// Bare `/summary`: catch up from when you last left the app here.
+    CatchUp,
+    Window(chrono::Duration),
+    /// Not a `<count><unit>` duration at all.
+    Unparseable,
+    /// Parsed, but empty (`0h`): there is no window to read.
+    TooShort,
+    /// Parsed, but past [`SUMMARY_MAX_WINDOW_HOURS`]. Refused rather than
+    /// clamped, so the answer is never narrower than the question.
+    TooLong,
+}
+
+/// Parse the argument of `/summary [<count>h|<count>m]`.
+///
+/// The unit is required (`6h`, `90m`): a bare `6` could mean either, and
+/// guessing for the user is how a catch-up quietly covers the wrong day.
+fn parse_summary_arg(rest: &str) -> SummaryArg {
+    let arg = rest.trim().to_ascii_lowercase();
+    if arg.is_empty() {
+        return SummaryArg::CatchUp;
+    }
+    let (count, minutes_per_unit) = match (arg.strip_suffix('h'), arg.strip_suffix('m')) {
+        (Some(count), _) => (count, 60),
+        (None, Some(count)) => (count, 1),
+        (None, None) => return SummaryArg::Unparseable,
+    };
+    // `u32` keeps the multiply below inside i64 whatever is typed, and
+    // refuses the sign and decimal point along with the rest of the junk.
+    let Ok(count) = count.parse::<u32>() else {
+        return SummaryArg::Unparseable;
+    };
+    match i64::from(count) * minutes_per_unit {
+        0 => SummaryArg::TooShort,
+        minutes if minutes > crate::app::ai::summary::SUMMARY_MAX_WINDOW_HOURS * 60 => {
+            SummaryArg::TooLong
+        }
+        minutes => SummaryArg::Window(chrono::Duration::minutes(minutes)),
+    }
 }
 
 fn sentence_case(text: &str) -> String {

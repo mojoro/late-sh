@@ -266,8 +266,8 @@ impl RightSidebarComponent {
     /// Default order, top to bottom. Used when a user has no stored list and
     /// to backfill any panels missing from a stored list. Space cuts by
     /// shrink priority; Bonsai is the one flexible panel and absorbs leftover
-    /// rows. Stale stored keys (e.g. the retired "activity" and "visualizer"
-    /// panels) are dropped on read by `from_key`.
+    /// rows. Stale stored keys (e.g. the retired "activity", "visualizer" and
+    /// "pot" panels) are dropped on read by `from_key`.
     pub const ALL: [RightSidebarComponent; RIGHT_SIDEBAR_COMPONENT_COUNT] =
         [Self::Daily, Self::Music, Self::Bonsai];
 
@@ -380,6 +380,7 @@ const TRANSLATE_MINE_TO_EN_KEY: &str = "translate_mine_to_en";
 const SHOW_FLAG_FALLBACK_KEY: &str = "show_flag_fallback";
 const CLUBHOUSE_TUTORIAL_DONE_KEY: &str = "clubhouse_tutorial_done";
 const FAVORITE_ROOM_IDS_KEY: &str = "favorite_room_ids";
+const FAVORITE_THEME_IDS_KEY: &str = "favorite_theme_ids";
 const BIO_KEY: &str = "bio";
 const COUNTRY_KEY: &str = "country";
 const TIMEZONE_KEY: &str = "timezone";
@@ -389,6 +390,17 @@ const OS_KEY: &str = "os";
 const LANGS_KEY: &str = "langs";
 
 impl User {
+    /// Whether this account is one of the app's own actors (the ghost bots,
+    /// the `system` feed author). Set in `settings.bot` when the row is
+    /// ensured. Callers use it to keep player-to-player mechanics between
+    /// players: nobody tips the house.
+    pub fn is_bot(&self) -> bool {
+        self.settings
+            .get("bot")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     pub async fn find_by_fingerprint(client: &Client, fingerprint: &str) -> Result<Option<Self>> {
         let row = client
             .query_opt(
@@ -574,22 +586,40 @@ impl User {
                               AND dynamic_up.equipped_slot = $3
                               AND dynamic_bonsai.sku = $4
                         ) AS dynamic_bonsai_selected,
-                        flag.payload->>'emoji' AS chat_flag,
-                        badge.payload->>'emoji' AS chat_badge,
+                        flag_rental.payload->>'emoji' AS chat_flag,
+                        badge_rental.payload->>'emoji' AS chat_badge,
                         award.badges AS profile_award_badges
                  FROM users u
                  LEFT JOIN bonsai_trees t ON t.user_id = u.id
                  LEFT JOIN bonsai_v2_trees v2 ON v2.user_id = u.id
-                 LEFT JOIN user_purchases up
-                   ON up.user_id = u.id
-                  AND up.equipped_slot = $2
-                 LEFT JOIN marketplace_items badge
-                   ON badge.id = up.item_id
-                 LEFT JOIN user_purchases flag_up
-                   ON flag_up.user_id = u.id
-                  AND flag_up.equipped_slot = $5
-                 LEFT JOIN marketplace_items flag
-                   ON flag.id = flag_up.item_id
+                 -- A rental is the only thing that fills these two slots.
+                 -- Expiry is read-time: once `ends_at` passes the label goes
+                 -- bare, with no background job to run. Migration 165 cleared
+                 -- the last permanent equips, so `equipped_slot` no longer
+                 -- carries a badge or a flag; $2 and $5 are effect kinds here,
+                 -- and `bonsai_variant` above is the only equip slot left.
+                 LEFT JOIN LATERAL (
+                    SELECT e.payload
+                    FROM shop_consumable_effects e
+                    WHERE e.user_id = u.id
+                      AND e.room_id IS NULL
+                      AND e.effect_kind = $2
+                      AND e.active = true
+                      AND e.ends_at > current_timestamp
+                    ORDER BY e.ends_at DESC
+                    LIMIT 1
+                 ) badge_rental ON true
+                 LEFT JOIN LATERAL (
+                    SELECT e.payload
+                    FROM shop_consumable_effects e
+                    WHERE e.user_id = u.id
+                      AND e.room_id IS NULL
+                      AND e.effect_kind = $5
+                      AND e.active = true
+                      AND e.ends_at > current_timestamp
+                    ORDER BY e.ends_at DESC
+                    LIMIT 1
+                 ) flag_rental ON true
                  LEFT JOIN LATERAL (
                     SELECT string_agg(
                         CASE category
@@ -606,6 +636,10 @@ impl User {
                           WHEN 'greendragon_dragon' THEN 'GDS'
                           WHEN 'darkroom_escape' THEN 'ADE'
                           WHEN 'darkroom_beacon' THEN 'ADB'
+                          -- Monthly like the boards below, rankless like the
+                          -- milestones above: one holder, so no rank digit
+                          -- (`profile_award::is_rankless_award`).
+                          WHEN 'crown' THEN 'CRWN'
                           ELSE (
                             CASE category
                               WHEN 'top_chips' THEN 'CHIP'
@@ -622,6 +656,7 @@ impl User {
                                  CASE category
                                    WHEN 'arcade_wins' THEN 0
                                    WHEN 'top_chips' THEN 1
+                                   WHEN 'crown' THEN 5
                                    WHEN 'tetris' THEN 2
                                    WHEN 'twenty_forty_eight' THEN 3
                                    WHEN 'snake' THEN 4
@@ -1459,6 +1494,31 @@ pub fn extract_favorite_room_ids(settings: &Value) -> Vec<Uuid> {
         };
         if seen.insert(id) {
             out.push(id);
+        }
+    }
+    out
+}
+
+/// Theme ids the user has starred, in the order they starred them. Ids are
+/// opaque strings rather than uuids and are not validated against the theme
+/// table here: a theme that gets renamed or retired simply stops matching, and
+/// the stale entry is inert until the user unstars it.
+pub fn extract_favorite_theme_ids(settings: &Value) -> Vec<String> {
+    let Some(entries) = settings
+        .get(FAVORITE_THEME_IDS_KEY)
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(id) = entry.as_str().map(str::trim).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        if seen.insert(id.to_string()) {
+            out.push(id.to_string());
         }
     }
     out

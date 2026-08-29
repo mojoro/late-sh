@@ -6,8 +6,12 @@ use uuid::Uuid;
 
 use super::{
     chips::{ChipMove, INITIAL_CHIP_BALANCE, UserChips},
+    rental::{
+        BADGE_RENTAL_ITEM_KIND, BadgeRental, CustomTitle, RENTAL_DAY_SECS, TITLE_EFFECT_KIND,
+        TITLE_RENTAL_ITEM_KIND, is_custom_title, title_from_payload,
+    },
     shop_consumable_effect::ShopConsumableEffect,
-    username_effect::{USERNAME_EFFECT_DURATION_SECS, USERNAME_EFFECT_KIND, UsernameEffect},
+    username_effect::{USERNAME_EFFECT_KIND, UsernameEffect},
 };
 
 pub const PET_COMPANION_SKU: &str = "pet_companion";
@@ -80,6 +84,23 @@ impl From<tokio_postgres::Row> for MarketplaceItem {
 }
 
 impl MarketplaceItem {
+    /// One purchasable item by SKU, under the same visibility rule as
+    /// `list_visible`. `None` for an unknown, retired, or out-of-window SKU.
+    pub async fn find_visible_by_sku(client: &Client, sku: &str) -> Result<Option<Self>> {
+        let row = client
+            .query_opt(
+                "SELECT *
+                 FROM marketplace_items
+                 WHERE sku = $1
+                   AND active = true
+                   AND (starts_at IS NULL OR starts_at <= current_timestamp)
+                   AND (ends_at IS NULL OR ends_at > current_timestamp)",
+                &[&sku],
+            )
+            .await?;
+        Ok(row.map(Self::from))
+    }
+
     pub async fn list_visible(client: &Client) -> Result<Vec<Self>> {
         let rows = client
             .query(
@@ -197,6 +218,12 @@ pub struct PurchaseWithEffectResult {
     /// The user-scoped Bonsai Decay Shield row activated (or extended) by
     /// this purchase, when the bought item is a `bonsai_consumable`.
     pub bonsai_decay_protection: Option<ShopConsumableEffect>,
+    /// The user-scoped chat badge or flag rental activated by this purchase,
+    /// when the bought item is a `badge_rental`.
+    pub badge_rental: Option<ShopConsumableEffect>,
+    /// The user-scoped title rental activated by this purchase, when the
+    /// bought item is a `title_rental`.
+    pub title_rental: Option<ShopConsumableEffect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,9 +264,11 @@ pub async fn purchase_durable_item_by_sku(
     user_id: Uuid,
     sku: &str,
 ) -> Result<Option<PurchaseResult>> {
-    Ok(purchase_item_by_sku_inner(client, user_id, sku, None, None)
-        .await?
-        .purchase)
+    Ok(
+        purchase_item_by_sku_inner(client, user_id, sku, None, None, None)
+            .await?
+            .purchase,
+    )
 }
 
 pub async fn purchase_item_by_sku_with_chat_effect(
@@ -248,7 +277,7 @@ pub async fn purchase_item_by_sku_with_chat_effect(
     sku: &str,
     room_id: Option<Uuid>,
 ) -> Result<PurchaseWithEffectResult> {
-    purchase_item_by_sku_inner(client, user_id, sku, Some(room_id), None).await
+    purchase_item_by_sku_inner(client, user_id, sku, Some(room_id), None, None).await
 }
 
 pub async fn purchase_item_by_sku_with_username_effect(
@@ -257,7 +286,21 @@ pub async fn purchase_item_by_sku_with_username_effect(
     sku: &str,
     effect: UsernameEffect,
 ) -> Result<PurchaseWithEffectResult> {
-    purchase_item_by_sku_inner(client, user_id, sku, None, Some(effect)).await
+    purchase_item_by_sku_inner(client, user_id, sku, None, Some(effect), None).await
+}
+
+/// Rent a title the buyer wrote themselves. The text arrives as a
+/// `CustomTitle`, so it has already passed every rule a rendered title must
+/// obey; what this path still enforces is that the SKU actually sells a custom
+/// title, and it does so inside the transaction, so a mismatch rolls the debit
+/// back instead of charging for a title nothing would wear.
+pub async fn purchase_item_by_sku_with_custom_title(
+    client: &mut Client,
+    user_id: Uuid,
+    sku: &str,
+    title: CustomTitle,
+) -> Result<PurchaseWithEffectResult> {
+    purchase_item_by_sku_inner(client, user_id, sku, None, None, Some(title)).await
 }
 
 async fn purchase_item_by_sku_inner(
@@ -266,6 +309,7 @@ async fn purchase_item_by_sku_inner(
     sku: &str,
     chat_effect_room_id: Option<Option<Uuid>>,
     username_effect: Option<UsernameEffect>,
+    custom_title: Option<CustomTitle>,
 ) -> Result<PurchaseWithEffectResult> {
     let tx = client.transaction().await?;
 
@@ -288,6 +332,8 @@ async fn purchase_item_by_sku_inner(
             refresh_all_active_users: false,
             username_effect: None,
             bonsai_decay_protection: None,
+            badge_rental: None,
+            title_rental: None,
         });
     };
     let item = MarketplaceItem::from(item_row);
@@ -329,6 +375,8 @@ async fn purchase_item_by_sku_inner(
                 refresh_all_active_users: false,
                 username_effect: None,
                 bonsai_decay_protection: None,
+                badge_rental: None,
+                title_rental: None,
             });
         }
     }
@@ -349,6 +397,8 @@ async fn purchase_item_by_sku_inner(
                 refresh_all_active_users: false,
                 username_effect: None,
                 bonsai_decay_protection: None,
+                badge_rental: None,
+                title_rental: None,
             });
         }
 
@@ -365,6 +415,8 @@ async fn purchase_item_by_sku_inner(
                 refresh_all_active_users: false,
                 username_effect: None,
                 bonsai_decay_protection: None,
+                badge_rental: None,
+                title_rental: None,
             });
         }
 
@@ -381,6 +433,8 @@ async fn purchase_item_by_sku_inner(
                 refresh_all_active_users: false,
                 username_effect: None,
                 bonsai_decay_protection: None,
+                badge_rental: None,
+                title_rental: None,
             });
         }
 
@@ -411,6 +465,9 @@ async fn purchase_item_by_sku_inner(
             activate_username_effect_in_tx(&tx, user_id, &item, username_effect).await?;
         let activated_bonsai_decay_protection =
             activate_bonsai_decay_protection_in_tx(&tx, user_id, &item).await?;
+        let activated_badge_rental = activate_badge_rental_in_tx(&tx, user_id, &item).await?;
+        let activated_title_rental =
+            activate_title_rental_in_tx(&tx, user_id, &item, custom_title).await?;
         let payload = user_id.to_string();
         tx.execute(
             "SELECT pg_notify($1, $2)",
@@ -436,6 +493,8 @@ async fn purchase_item_by_sku_inner(
             refresh_all_active_users,
             username_effect: activated_username_effect,
             bonsai_decay_protection: activated_bonsai_decay_protection,
+            badge_rental: activated_badge_rental,
+            title_rental: activated_title_rental,
         });
     }
 
@@ -452,6 +511,8 @@ async fn purchase_item_by_sku_inner(
             refresh_all_active_users: false,
             username_effect: None,
             bonsai_decay_protection: None,
+            badge_rental: None,
+            title_rental: None,
         });
     }
 
@@ -468,6 +529,8 @@ async fn purchase_item_by_sku_inner(
             refresh_all_active_users: false,
             username_effect: None,
             bonsai_decay_protection: None,
+            badge_rental: None,
+            title_rental: None,
         });
     }
 
@@ -514,6 +577,9 @@ async fn purchase_item_by_sku_inner(
         activate_username_effect_in_tx(&tx, user_id, &item, username_effect).await?;
     let activated_bonsai_decay_protection =
         activate_bonsai_decay_protection_in_tx(&tx, user_id, &item).await?;
+    let activated_badge_rental = activate_badge_rental_in_tx(&tx, user_id, &item).await?;
+    let activated_title_rental =
+        activate_title_rental_in_tx(&tx, user_id, &item, custom_title).await?;
     let payload = user_id.to_string();
     tx.execute(
         "SELECT pg_notify($1, $2)",
@@ -540,6 +606,8 @@ async fn purchase_item_by_sku_inner(
         refresh_all_active_users,
         username_effect: activated_username_effect,
         bonsai_decay_protection: activated_bonsai_decay_protection,
+        badge_rental: activated_badge_rental,
+        title_rental: activated_title_rental,
     })
 }
 
@@ -1060,6 +1128,8 @@ fn is_repeatable_purchase_item(item: &MarketplaceItem) -> bool {
             | COMPANION_CONSUMABLE_ITEM_KIND
             | USERNAME_EFFECT_ITEM_KIND
             | BONSAI_CONSUMABLE_ITEM_KIND
+            | BADGE_RENTAL_ITEM_KIND
+            | TITLE_RENTAL_ITEM_KIND
     )
 }
 
@@ -1142,19 +1212,94 @@ async fn activate_username_effect_in_tx(
             choice.slug()
         );
     }
-    let duration_secs = item
-        .payload
-        .get("duration_secs")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(USERNAME_EFFECT_DURATION_SECS);
-
     let effect = ShopConsumableEffect::activate_user_effect_in_tx(
         tx,
         user_id,
         USERNAME_EFFECT_KIND,
         &item.sku,
-        duration_secs,
+        rental_duration_secs(item),
         choice.to_payload(),
+    )
+    .await?;
+    Ok(Some(effect))
+}
+
+/// How long the rental this item sells runs. The day tier carries 86400 and
+/// the month tier 2592000 in its payload; an item that carries neither falls
+/// back to the day window rather than activating forever. Shared by every
+/// rental kind (username effects, badge and flag rentals, titles) so the shop
+/// never quotes a window the activation would not honour.
+pub fn rental_duration_secs(item: &MarketplaceItem) -> i64 {
+    super::rental::duration_secs(&item.payload, RENTAL_DAY_SECS)
+}
+
+/// Activates the chat badge or flag rental bought in this transaction. The
+/// rental fills its slot through a user-scoped effect row rather than the
+/// legacy `equipped_slot` path, so it expires on its own and a rebuy of any
+/// badge for the same slot replaces the live row and resets the clock. A
+/// payload nothing could render fails the transaction: never charge for a
+/// badge that would not appear.
+async fn activate_badge_rental_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    user_id: Uuid,
+    item: &MarketplaceItem,
+) -> Result<Option<ShopConsumableEffect>> {
+    if item.item_kind != BADGE_RENTAL_ITEM_KIND {
+        return Ok(None);
+    }
+    let Some(rental) = BadgeRental::from_payload(&item.payload) else {
+        bail!("badge rental {} has no renderable emoji and slot", item.sku);
+    };
+    let effect = ShopConsumableEffect::activate_user_effect_in_tx(
+        tx,
+        user_id,
+        rental.slot.effect_kind(),
+        &item.sku,
+        rental_duration_secs(item),
+        item.payload.clone(),
+    )
+    .await?;
+    Ok(Some(effect))
+}
+
+/// Activates the title rental bought in this transaction. One active title per
+/// user, rebuy replaces, exactly the username-effect path; a title and a
+/// username color are separate effect kinds, so buying one never clears the
+/// other.
+///
+/// Where the text comes from is the SKU's call, not the caller's: a curated
+/// SKU wears what its payload carries and refuses buyer text, a custom SKU
+/// wears the buyer's text and refuses to activate without it. Either mismatch
+/// fails the transaction, so nobody is charged for a title that could not be
+/// the one they asked for.
+async fn activate_title_rental_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    user_id: Uuid,
+    item: &MarketplaceItem,
+    custom_title: Option<CustomTitle>,
+) -> Result<Option<ShopConsumableEffect>> {
+    if item.item_kind != TITLE_RENTAL_ITEM_KIND {
+        if custom_title.is_some() {
+            bail!("{} is not a title rental and takes no title text", item.sku);
+        }
+        return Ok(None);
+    }
+    let text = match (is_custom_title(&item.payload), custom_title) {
+        (true, Some(title)) => title.into_string(),
+        (true, None) => bail!("custom title {} requires the buyer's text", item.sku),
+        (false, Some(_)) => bail!("curated title {} takes no custom text", item.sku),
+        (false, None) => match title_from_payload(&item.payload) {
+            Some(text) => text,
+            None => bail!("title rental {} carries no title text", item.sku),
+        },
+    };
+    let effect = ShopConsumableEffect::activate_user_effect_in_tx(
+        tx,
+        user_id,
+        TITLE_EFFECT_KIND,
+        &item.sku,
+        rental_duration_secs(item),
+        serde_json::json!({"text": text}),
     )
     .await?;
     Ok(Some(effect))

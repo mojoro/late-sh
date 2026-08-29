@@ -1,16 +1,24 @@
 use serde_json::{Value, json};
 
-/// `shop_consumable_effects.effect_kind` for the user-scoped 24h username
-/// effects (Name Glow / Name Gradient / Name Shimmer). One active effect per
-/// user: activating any username effect deactivates the previous one.
+/// `shop_consumable_effects.effect_kind` for the user-scoped username effects
+/// (Name Glow / Name Gradient / Name Shimmer, each sold in a 24h and a 30-day
+/// tier). One active effect per user: activating any username effect
+/// deactivates the previous one, whichever tier it came from.
 pub const USERNAME_EFFECT_KIND: &str = "username_effect";
 
 pub const USERNAME_GLOW_SKU: &str = "username_glow_day";
 pub const USERNAME_GRADIENT_SKU: &str = "username_gradient_day";
 pub const USERNAME_SHIMMER_SKU: &str = "username_shimmer_day";
 
-/// Default effect duration when an item payload omits `duration_secs`.
-pub const USERNAME_EFFECT_DURATION_SECS: i64 = 86_400;
+/// The month tier: the same three styles, 30 days instead of 24 hours, at 30x
+/// the day price. Same variants and same picker; only `duration_secs` and the
+/// price differ, so nothing downstream branches on the tier.
+pub const USERNAME_GLOW_MONTH_SKU: &str = "username_glow_month";
+pub const USERNAME_GRADIENT_MONTH_SKU: &str = "username_gradient_month";
+pub const USERNAME_SHIMMER_MONTH_SKU: &str = "username_shimmer_month";
+
+// How long each tier runs, and the copy that quotes it, live in
+// `models::rental`: a username effect is one rental among several now.
 
 /// The buyer-picked color for the Name Glow effect. RGB values live in
 /// `late-ssh` (theme territory); this enum only names the choice so the
@@ -88,9 +96,10 @@ impl GradientPair {
     }
 }
 
-/// A purchased 24h username effect, as persisted in the effect row payload.
-/// Glow paints the name one bright color, Gradient fades it between a preset
-/// pair, Shimmer animates through the glow palette.
+/// A purchased username effect, as persisted in the effect row payload. Glow
+/// paints the name one bright color, Gradient fades it between a preset pair,
+/// Shimmer animates through the glow palette. The payload carries the style
+/// only; how long it runs lives on the effect row's `ends_at`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UsernameEffect {
     Glow(GlowColor),

@@ -118,6 +118,13 @@ impl App {
             }
             changed = true;
         }
+        // UTC midnight rolls the Arcade dailies over. This rides the 1Hz edge
+        // rather than an input path so a session parked in chat overnight is
+        // already on today's boards when it looks at the Arcade again; the
+        // check is a date comparison per game until the day actually changes.
+        if one_hz && crate::app::arcade::workspace::refresh_daily_games(self) {
+            changed = true;
+        }
         if self.screen == Screen::Clubhouse && anim_half {
             // Only cosmetic ambience animates on the tick counter (jukebox
             // EQ, emote arms, fire/candles/stars); walker positions are
@@ -162,6 +169,8 @@ impl App {
                 Ok(url) => {
                     if let Some(room_id) = target_room_id.or(self.chat.selected_room_id) {
                         self.chat.start_composing_in_room(room_id);
+                        // After `start_composing_in_room`, which clears it.
+                        self.chat.restore_image_upload_reply_target();
                         self.chat.composer_push_str(&url);
                     }
                     self.banner = Some(crate::app::common::primitives::Banner::success(
@@ -169,6 +178,9 @@ impl App {
                     ));
                 }
                 Err(msg) => {
+                    // Nothing reopens the composer on failure, so the stashed
+                    // reply would otherwise surface on the next upload.
+                    self.chat.clear_image_upload_reply_target();
                     self.banner = Some(crate::app::common::primitives::Banner::error(&msg));
                 }
             }
@@ -222,6 +234,8 @@ impl App {
         changed |= self.voice.tick();
         changed |= self.drain_voice_join_results();
         changed |= self.tick_stream();
+        changed |= self.tick_crown();
+        changed |= self.tick_pot();
         // News state is ticked inside chat.tick()
         let profile_tick = self.profile_state.tick();
         changed |= profile_tick.changed;
@@ -231,12 +245,21 @@ impl App {
         }
         self.chat
             .set_favorite_room_ids(self.profile_state.profile().favorite_room_ids.clone());
+        self.chat
+            .set_viewer_tz(crate::app::profile::svc::parse_account_tz(
+                self.profile_state.profile().timezone.as_deref(),
+            ));
+        // The AFK line: how long this terminal's keyboard has been quiet is
+        // an `App` fact, mirrored into chat the same way the timezone is,
+        // because chat is what knows which room is on screen to hang it on.
+        changed |= self.chat.sync_afk_line(self.last_input_at.elapsed());
         let translate_to = self.profile_state.profile().translate_to;
         let auto_translate = self.profile_state.profile().auto_translate;
         changed |= self
             .chat
             .set_translate_settings(translate_to, auto_translate);
         changed |= self.sudoku_state.poll_daily_generation();
+        changed |= self.le_word_state.poll_word_reload();
         let settings_tick = self.settings_modal_state.tick();
         changed |= settings_tick.changed;
         if let Some(b) = settings_tick.banner {
@@ -264,8 +287,11 @@ impl App {
                         tracing::warn!("ignoring unsolicited paired clipboard image");
                         continue;
                     };
-                    if let Some(banner) = self.chat.start_image_upload_in_room(data, upload.room_id)
-                    {
+                    if let Some(banner) = self.chat.start_image_upload_in_room(
+                        data,
+                        upload.room_id,
+                        upload.reply_target,
+                    ) {
                         self.banner = Some(banner);
                     } else {
                         self.banner = Some(crate::app::common::primitives::Banner::success(
@@ -597,15 +623,41 @@ impl App {
                 self.chat_ctx_epoch += 1;
             }
             if let Some(directory) = &self.flair_directory {
+                let now = chrono::Utc::now();
                 let phase = crate::app::common::username_effect::shimmer_phase(self.marquee_tick);
-                let name_styles = crate::app::common::username_effect::resolve_all(
+                // The crown rides the same map, and lapses the same way: an
+                // entry from a finished UTC month resolves to nobody, which
+                // is what empties the slot at the rollover with no sweeper.
+                let crown_holder = self
+                    .crown_holder_rx
+                    .as_mut()
+                    .and_then(|rx| *rx.borrow_and_update())
+                    .and_then(|holder| holder.if_current(now));
+                let name_flair = crate::app::common::username_effect::resolve_all(
                     &crate::app::common::username_effect::snapshot(directory),
+                    crown_holder,
                     phase,
+                    now,
+                );
+                if self.name_flair != name_flair {
+                    self.name_flair = name_flair;
+                    self.chat_ctx_epoch += 1;
+                }
+            }
+            // The pot resolves on the same edge, and for the same reason:
+            // the panel reads owned values, and only a change the viewer can
+            // actually see (a new size, a minute off the countdown) marks the
+            // frame dirty.
+            if let Some(rx) = &mut self.pot_snapshot_rx {
+                let snapshot = rx.borrow_and_update().clone();
+                let pot_view = crate::app::pot::state::PotView::resolve(
+                    &snapshot,
+                    self.user_id,
                     chrono::Utc::now(),
                 );
-                if self.name_styles != name_styles {
-                    self.name_styles = name_styles;
-                    self.chat_ctx_epoch += 1;
+                if self.pot_view != pot_view {
+                    self.pot_view = pot_view;
+                    changed = true;
                 }
             }
             // Peer countdowns resolve on the same edge, and only the minute

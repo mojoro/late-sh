@@ -42,6 +42,7 @@ fn repeat_window_drops_same_shape_and_keeps_distinct() {
 
 #[test]
 fn username_effect_repeat_keys_on_full_style_slug() {
+    use late_core::models::rental::RENTAL_DAY_SECS;
     use late_core::models::username_effect::{GlowColor, UsernameEffect};
 
     let mut recent = HashMap::new();
@@ -50,15 +51,49 @@ fn username_effect_repeat_keys_on_full_style_slug() {
         user,
         "mira",
         UsernameEffect::Glow(GlowColor::Ember),
+        RENTAL_DAY_SECS,
     );
     assert!(!is_repeat(&mut recent, &ember));
     // Rebuying the same look inside the window stays quiet...
     assert!(is_repeat(&mut recent, &ember));
     // ...but a new color or a new style visibly changed the name, so it
     // announces again.
-    let sky =
-        ActivityEvent::username_effect_applied(user, "mira", UsernameEffect::Glow(GlowColor::Sky));
+    let sky = ActivityEvent::username_effect_applied(
+        user,
+        "mira",
+        UsernameEffect::Glow(GlowColor::Sky),
+        RENTAL_DAY_SECS,
+    );
     assert!(!is_repeat(&mut recent, &sky));
-    let shimmer = ActivityEvent::username_effect_applied(user, "mira", UsernameEffect::Shimmer);
+    let shimmer = ActivityEvent::username_effect_applied(
+        user,
+        "mira",
+        UsernameEffect::Shimmer,
+        RENTAL_DAY_SECS,
+    );
     assert!(!is_repeat(&mut recent, &shimmer));
+}
+
+/// A whale who climbs two rungs in one sitting gets two lines: the rungs are
+/// distinct purchases and each is its own six-figure story. Keying on the
+/// buyer alone would have swallowed the second.
+#[test]
+fn burn_milestones_key_on_the_rung_not_the_buyer() {
+    let mut recent = HashMap::new();
+    let buyer = Uuid::now_v7();
+    let wick = ActivityEvent::burn_milestone(buyer, "mira", "Wick", "\u{1F56F}\u{FE0F}", 50_000);
+    let furnace = ActivityEvent::burn_milestone(buyer, "mira", "Furnace", "\u{1F30B}", 500_000);
+
+    assert!(!is_repeat(&mut recent, &wick));
+    assert!(!is_repeat(&mut recent, &furnace));
+    assert!(is_repeat(&mut recent, &wick));
+}
+
+/// The line is the receipt: it names the price in full, with separators, and
+/// shows the glyph everyone is about to see beside the name.
+#[test]
+fn a_burn_milestone_line_quotes_the_price_and_the_glyph() {
+    let event = ActivityEvent::burn_milestone(Uuid::now_v7(), "mira", "Fuse", "\u{1F9E8}", 150_000);
+    assert_eq!(event.action, "burned 150,000 chips for the Fuse \u{1F9E8}");
+    assert!(!event.action.contains('@'));
 }

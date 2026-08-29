@@ -1,5 +1,8 @@
 use super::*;
 
+use crate::app::common::primitives::BannerKind;
+use late_core::models::rental::{RENTAL_DAY_SECS, RENTAL_MONTH_SECS, TITLE_MAX_LEN};
+
 fn make_state() -> ShopState {
     let snapshot = ShopSnapshot {
         user_id: None,
@@ -10,6 +13,12 @@ fn make_state() -> ShopState {
         aquarium_hungry: false,
         active_username_effect: None,
         active_bonsai_decay_protection: None,
+        active_badge_rental: None,
+        active_flag_rental: None,
+        active_title: None,
+        chat_label_badge: None,
+        chat_label_flag: None,
+        custom_titles_available: true,
     };
     ShopState::for_test_snapshot(snapshot)
 }
@@ -58,7 +67,7 @@ fn select_category_by_index_switches_and_resets_selection() {
     state.select_category_by_index(2);
 
     assert_eq!(state.selected_category_index(), 2);
-    assert_eq!(state.selected_category(), ShopCategory::Aquarium);
+    assert_eq!(state.selected_category(), ShopCategory::Flags);
     assert_eq!(state.selected_index, 0);
     assert!(state.pending_room_effect.is_none());
 }
@@ -112,6 +121,9 @@ fn glow_item() -> ShopCatalogItem {
         requires_room: false,
         daily_limited: false,
         username_effect_variant: Some("glow".to_string()),
+        rental_duration_secs: Some(RENTAL_DAY_SECS),
+        badge_slot: None,
+        custom_title: false,
     }
 }
 
@@ -125,6 +137,12 @@ fn make_state_with_glow_item() -> ShopState {
         aquarium_hungry: false,
         active_username_effect: None,
         active_bonsai_decay_protection: None,
+        active_badge_rental: None,
+        active_flag_rental: None,
+        active_title: None,
+        chat_label_badge: None,
+        chat_label_flag: None,
+        custom_titles_available: true,
     };
     ShopState::for_test_snapshot(snapshot)
 }
@@ -169,6 +187,7 @@ fn visible_items_lead_with_username_effects() {
         sku: "chat_confetti".to_string(),
         item_kind: "chat_consumable".to_string(),
         username_effect_variant: None,
+        rental_duration_secs: None,
         ..glow_item()
     };
     let snapshot = ShopSnapshot {
@@ -180,6 +199,12 @@ fn visible_items_lead_with_username_effects() {
         aquarium_hungry: false,
         active_username_effect: None,
         active_bonsai_decay_protection: None,
+        active_badge_rental: None,
+        active_flag_rental: None,
+        active_title: None,
+        chat_label_badge: None,
+        chat_label_flag: None,
+        custom_titles_available: true,
     };
     let state = ShopState::for_test_snapshot(snapshot);
     let skus: Vec<&str> = state
@@ -188,6 +213,152 @@ fn visible_items_lead_with_username_effects() {
         .map(|item| item.sku.as_str())
         .collect();
     assert_eq!(skus, vec!["username_glow_day", "chat_confetti"]);
+}
+
+/// The one title the Shop sells: the buyer writes the text, so the catalog
+/// row carries none.
+fn custom_title_item() -> ShopCatalogItem {
+    ShopCatalogItem {
+        sku: "title_custom_day".to_string(),
+        item_kind: "title_rental".to_string(),
+        name: "Your Own Title".to_string(),
+        price_chips: 2_000,
+        consumable_category: None,
+        effect_kind: None,
+        username_effect_variant: None,
+        rental_duration_secs: Some(RENTAL_DAY_SECS),
+        custom_title: true,
+        ..glow_item()
+    }
+}
+
+fn snapshot_with(items: Vec<ShopCatalogItem>) -> ShopSnapshot {
+    ShopSnapshot {
+        user_id: None,
+        balance: 10_000,
+        items,
+        entitlements: ShopEntitlements::default(),
+        active_room_effects: HashMap::new(),
+        aquarium_hungry: false,
+        active_username_effect: None,
+        active_bonsai_decay_protection: None,
+        active_badge_rental: None,
+        active_flag_rental: None,
+        active_title: None,
+        chat_label_badge: None,
+        chat_label_flag: None,
+        custom_titles_available: true,
+    }
+}
+
+#[test]
+fn visible_chat_items_put_titles_under_username_effects() {
+    let confetti = ShopCatalogItem {
+        sku: "chat_confetti".to_string(),
+        item_kind: "chat_consumable".to_string(),
+        username_effect_variant: None,
+        rental_duration_secs: None,
+        ..glow_item()
+    };
+    let state = ShopState::for_test_snapshot(snapshot_with(vec![
+        confetti,
+        custom_title_item(),
+        glow_item(),
+    ]));
+    let skus: Vec<&str> = state
+        .visible_items()
+        .iter()
+        .map(|item| item.sku.as_str())
+        .collect();
+    assert_eq!(
+        skus,
+        vec!["username_glow_day", "title_custom_day", "chat_confetti"]
+    );
+}
+
+#[test]
+fn the_own_chat_badge_joins_the_label_query_flag_first() {
+    let mut snapshot = snapshot_with(Vec::new());
+    assert_eq!(
+        ShopState::for_test_snapshot(snapshot.clone()).equipped_chat_badge(),
+        None
+    );
+
+    snapshot.chat_label_badge = Some("🐱".to_string());
+    assert_eq!(
+        ShopState::for_test_snapshot(snapshot.clone()).equipped_chat_badge(),
+        Some("🐱".to_string())
+    );
+
+    snapshot.chat_label_flag = Some("🇵🇱".to_string());
+    assert_eq!(
+        ShopState::for_test_snapshot(snapshot).equipped_chat_badge(),
+        Some("🇵🇱 🐱".to_string())
+    );
+}
+
+#[test]
+fn expired_rentals_prune_and_flag_change() {
+    let past = Utc::now() - chrono::Duration::seconds(1);
+    let future = Utc::now() + chrono::Duration::hours(1);
+    let rental = |ends_at| ActiveRental {
+        label: "🐱".to_string(),
+        source_sku: "badge_cat_day".to_string(),
+        ends_at,
+    };
+    let mut snapshot = snapshot_with(Vec::new());
+    snapshot.active_badge_rental = Some(rental(past));
+    snapshot.active_flag_rental = Some(rental(future));
+    snapshot.active_title = Some(rental(past));
+
+    let mut state = ShopState::for_test_snapshot(snapshot);
+    let tick = state.tick();
+    assert!(tick.snapshot_changed);
+    assert!(state.active_badge_rental().is_none());
+    assert!(state.active_title().is_none());
+    assert!(
+        state.active_flag_rental().is_some(),
+        "a rental that has not lapsed stays"
+    );
+
+    // Nothing left to prune: a second tick reports no change.
+    assert!(!state.tick().snapshot_changed);
+}
+
+#[test]
+fn username_effect_picker_carries_the_bought_tier_duration() {
+    let month = ShopCatalogItem {
+        sku: "username_glow_month".to_string(),
+        name: "Name Glow Monthly".to_string(),
+        price_chips: 6_000,
+        rental_duration_secs: Some(RENTAL_MONTH_SECS),
+        badge_slot: None,
+        ..glow_item()
+    };
+    let snapshot = ShopSnapshot {
+        user_id: None,
+        balance: 10_000,
+        items: vec![month],
+        entitlements: ShopEntitlements::default(),
+        active_room_effects: HashMap::new(),
+        aquarium_hungry: false,
+        active_username_effect: None,
+        active_bonsai_decay_protection: None,
+        active_badge_rental: None,
+        active_flag_rental: None,
+        active_title: None,
+        chat_label_badge: None,
+        chat_label_flag: None,
+        custom_titles_available: true,
+    };
+    let mut state = ShopState::for_test_snapshot(snapshot);
+    state.activate_selected(None);
+
+    let pending = state.pending_username_effect().expect("picker armed");
+    assert_eq!(pending.sku, "username_glow_month");
+    assert_eq!(pending.duration_secs, RENTAL_MONTH_SECS);
+    // Same styles as the day tier: only the window and the price move.
+    assert_eq!(pending.options.len(), 6);
 }
 
 #[test]
@@ -222,4 +393,69 @@ fn rect_contains_edge_cases() {
     assert!(rect_contains(Rect::new(2, 3, 5, 1), 2, 3));
     assert!(!rect_contains(Rect::new(2, 3, 5, 1), 7, 3));
     assert!(!rect_contains(Rect::new(2, 3, 5, 1), 2, 4));
+}
+
+#[test]
+fn custom_title_enter_arms_a_prompt_that_stops_at_the_render_cap() {
+    let mut state = ShopState::for_test_snapshot(snapshot_with(vec![custom_title_item()]));
+    assert!(state.activate_selected(None).is_some());
+    let pending = state.pending_custom_title().expect("prompt armed");
+    assert_eq!(pending.sku, "title_custom_day");
+    assert_eq!(pending.duration_secs, RENTAL_DAY_SECS);
+    assert_eq!(pending.input, "");
+
+    for ch in "the last honest night clerk".chars() {
+        state.push_custom_title_char(ch);
+    }
+    let pending = state.pending_custom_title().expect("prompt armed");
+    assert_eq!(pending.len(), TITLE_MAX_LEN);
+    assert_eq!(pending.input, "the last honest nigh");
+
+    state.backspace_custom_title();
+    assert_eq!(
+        state.pending_custom_title().expect("prompt armed").input,
+        "the last honest nig"
+    );
+}
+
+#[test]
+fn a_custom_title_is_never_sold_without_a_screen_to_check_it() {
+    let mut snapshot = snapshot_with(vec![custom_title_item()]);
+    snapshot.custom_titles_available = false;
+    let mut state = ShopState::for_test_snapshot(snapshot);
+
+    let banner = state.activate_selected(None).expect("banner");
+    assert!(matches!(banner.kind, BannerKind::Error), "{banner:?}");
+    assert!(
+        state.pending_custom_title().is_none(),
+        "no prompt opens when nothing can screen the text"
+    );
+}
+
+#[test]
+fn a_blank_custom_title_prompt_sends_nothing_and_stays_open() {
+    let mut state = ShopState::for_test_snapshot(snapshot_with(vec![custom_title_item()]));
+    state.activate_selected(None);
+    state.push_custom_title_char(' ');
+    state.push_custom_title_char(' ');
+
+    let banner = state.confirm_pending_custom_title().expect("banner");
+    assert!(matches!(banner.kind, BannerKind::Error), "{banner:?}");
+    assert!(
+        state.pending_custom_title().is_some(),
+        "an unfinished title is not a refusal: the prompt stays up"
+    );
+}
+
+#[test]
+fn the_custom_title_prompt_clears_on_cancel_and_category_switch() {
+    let mut state = ShopState::for_test_snapshot(snapshot_with(vec![custom_title_item()]));
+    state.activate_selected(None);
+    assert!(state.cancel_pending_custom_title().is_some());
+    assert!(state.pending_custom_title().is_none());
+
+    state.activate_selected(None);
+    assert!(state.pending_custom_title().is_some());
+    state.select_next_category();
+    assert!(state.pending_custom_title().is_none());
 }

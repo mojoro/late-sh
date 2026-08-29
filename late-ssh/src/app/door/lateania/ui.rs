@@ -20,6 +20,7 @@ use super::{
     appearance,
     classes::Class,
     state::{ClickAction, Heading, MapMode, Panel, State},
+    stats::{POINT_EVERY_LEVELS, SCORE_CAP, Score},
     svc::{LeaderboardEntry, LogKind, MobView, PlayerView, QuestKind, QuestView, SectionRow},
     world::{Dir, MapCell, MiniMap, RoomId},
 };
@@ -68,6 +69,14 @@ pub fn draw_game(frame: &mut Frame, area: Rect, state: &State, usernames: &Usern
 
     if !view.archetype_choices.is_empty() {
         draw_archetype_select(frame, area, &view);
+        return;
+    }
+
+    if !view.score_offer.is_empty() {
+        frame.render_widget(
+            Paragraph::new(score_point_lines(&view, area.height)).wrap(Wrap { trim: false }),
+            area,
+        );
         return;
     }
 
@@ -549,6 +558,28 @@ fn hug_poi_arrows(
 /// on the field mean exactly one thing, walkable path: bright stubs are the
 /// current room's exits, faint stubs are paths running on into fog. POI
 /// direction arrows belong to the atlas only.
+/// The map header's layer caption. `z` counts layers, and for the underground
+/// zones it still reads as literal depth, but ever since each descent zone
+/// took its own level a couple of zones sit below z 0 while being open sky in
+/// the fiction. Those name their own layer while the player is looking at the
+/// layer they stand on; every other view keeps the plain depth wording.
+fn level_label(player_room: RoomId, viewed_z: i32, player_z: i32) -> String {
+    if viewed_z == player_z
+        && let Some(label) = match super::worldmap::zone_of(player_room) {
+            Some("Frostspire Ascent") => Some("mountainside"),
+            Some("the Saltwind Wharves") => Some("the waterline"),
+            _ => None,
+        }
+    {
+        return label.to_string();
+    }
+    match viewed_z {
+        0 => "surface".to_string(),
+        z if z < 0 => format!("underground {}", -z),
+        z => format!("above {z}"),
+    }
+}
+
 fn draw_field(frame: &mut Frame, area: Rect, view: &PlayerView) {
     use super::world::region_atlas_entry;
     use super::worldmap::{Tile, map_canvas, poi, world_coords};
@@ -578,11 +609,7 @@ fn draw_field(frame: &mut Frame, area: Rect, view: &PlayerView) {
 
     // Header: the land you stand in and the depth, so the field is grounded.
     let (region_name, tier) = region_atlas_entry(player_room).unwrap_or(("The wilds", ""));
-    let depth = match center.z {
-        0 => "surface".to_string(),
-        z if z < 0 => format!("underground {}", -z),
-        z => format!("above {z}"),
-    };
+    let depth = level_label(player_room, center.z, center.z);
     let mut header = vec![Span::styled(
         region_name.to_string(),
         Style::default()
@@ -604,6 +631,11 @@ fn draw_field(frame: &mut Frame, area: Rect, view: &PlayerView) {
     let body = rows[1];
     let cols = body.width as i32;
     let height = body.height as i32;
+    // Colour-coded detail on what's around you. Landmarks (boss/tame) come from
+    // the static atlas; a red dagger marks a room holding a live foe (from the
+    // snapshot's nearby list); a gem marks a harvestable resource room (static).
+    let foes: std::collections::HashSet<u32> = view.nearby_foes.iter().copied().collect();
+    let players: std::collections::HashSet<u32> = view.nearby_players.iter().copied().collect();
     let canvas = map_canvas(coords, center, cols, height, &view.visited, player_room);
 
     // The player token turns hostile-red in a fight, so a glance at the field
@@ -687,11 +719,6 @@ fn draw_field(frame: &mut Frame, area: Rect, view: &PlayerView) {
         }
     };
 
-    // Colour-coded detail on what's around you. Landmarks (boss/tame) come from
-    // the static atlas; a red dagger marks a room holding a live foe (from the
-    // snapshot's nearby list); a gem marks a harvestable resource room (static).
-    let foes: std::collections::HashSet<u32> = view.nearby_foes.iter().copied().collect();
-    let players: std::collections::HashSet<u32> = view.nearby_players.iter().copied().collect();
     let foe_style = Style::default()
         .fg(Color::Rgb(235, 90, 80))
         .add_modifier(Modifier::BOLD);
@@ -1420,11 +1447,7 @@ fn draw_world_map(frame: &mut Frame, area: Rect, state: &State, view: &PlayerVie
     // Header: region name, where this zone sits in the region's chain, the
     // zone's own name, the danger tier, and the current level (z).
     let (region_name, tier) = region_atlas_entry(player_room).unwrap_or(("The wilds", ""));
-    let level = match center.z {
-        0 => "surface".to_string(),
-        z if z < 0 => format!("underground {}", -z),
-        z => format!("above {z}"),
-    };
+    let level = level_label(player_room, center.z, player.z);
     let mut header = vec![Span::styled(
         region_name.to_string(),
         Style::default()
@@ -1483,6 +1506,22 @@ fn draw_world_map(frame: &mut Frame, area: Rect, state: &State, view: &PlayerVie
     let height = body.height as i32;
     let cx = (cols / 2) as usize;
     let cy = (height / 2) as usize;
+    // The room the player marked, resolved once per frame rather than per cell.
+    let dest_room = state.dest_room();
+    // Active-quest targets, when the overlay is on (`q`). Same-block targets
+    // get a `!` on their cell or a border arrow; cross-block ones are only
+    // counted - across reserved blocks an arrow's direction means nothing.
+    let quest_targets: Vec<super::world::RoomId> = if state.map_quests() {
+        view.quests
+            .iter()
+            .filter(|q| !q.done)
+            .filter_map(|q| q.target)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let quest_cells: std::collections::HashSet<super::world::RoomId> =
+        quest_targets.iter().copied().collect();
     let canvas = map_canvas(coords, center, cols, height, &view.visited, player_room);
 
     let player_style = Style::default()
@@ -1504,23 +1543,6 @@ fn draw_world_map(frame: &mut Frame, area: Rect, state: &State, view: &PlayerVie
     let quest_style = Style::default()
         .fg(theme::SUCCESS())
         .add_modifier(Modifier::BOLD);
-    // The room the player marked, resolved once per frame rather than per cell.
-    let dest_room = state.dest_room();
-    // Active-quest targets, when the overlay is on (`q`). Same-block targets
-    // get a `!` on their cell or a border arrow; cross-block ones are only
-    // counted - across reserved blocks an arrow's direction means nothing.
-    let quest_targets: Vec<super::world::RoomId> = if state.map_quests() {
-        view.quests
-            .iter()
-            .filter(|q| !q.done)
-            .filter_map(|q| q.target)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let quest_cells: std::collections::HashSet<super::world::RoomId> =
-        quest_targets.iter().copied().collect();
-
     let mut cells: Vec<Vec<(String, Style)>> = canvas
         .iter()
         .map(|row| {
@@ -1913,6 +1935,7 @@ fn draw_class_select(frame: &mut Frame, area: Rect, view: &PlayerView, cursor: u
     // The rolled scores in the same rated rows as the character sheet, with the
     // highlighted class's primary score glowing in its accent.
     lines.extend(attribute_lines(view, primary_label(Some(chosen)), accent));
+    lines.extend(attribute_rule_lines(view));
     lines.push(Line::raw(""));
     // One compact row per class; the highlighted one is expanded directly below
     // its row so cursor-following scroll keeps the choice and its details together.
@@ -1984,6 +2007,159 @@ fn draw_class_select(frame: &mut Frame, area: Rect, view: &PlayerView, cursor: u
     );
     let shown: Vec<Line<'static>> = lines.into_iter().skip(off).collect();
     frame.render_widget(Paragraph::new(shown).wrap(Wrap { trim: false }), area);
+}
+
+/// What the six scores do, in numbers, for this character: each score's
+/// current reading and the rule behind it. Under the rolled rows on the
+/// creation screen, so the roll is a decision made with the arithmetic in
+/// view rather than a promise.
+fn attribute_rule_lines(view: &PlayerView) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "What they do (modifier = (score-10)/2; a point to place every {POINT_EVERY_LEVELS} levels, scores cap at {SCORE_CAP}):"
+        ),
+        Style::default().fg(theme::TEXT_DIM()),
+    ))];
+    for which in Score::ALL {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} ", which.label()),
+                Style::default().fg(theme::AMBER()),
+            ),
+            Span::styled(
+                format!("{:<44}", view.scores.effect(which, view.level)),
+                Style::default().fg(theme::TEXT()),
+            ),
+            Span::styled(
+                which.rule().to_string(),
+                Style::default().fg(theme::TEXT_DIM()),
+            ),
+        ]));
+    }
+    lines
+}
+
+/// The attribute point screen: every score with what it does now, what one
+/// more point would do, and the rule behind it, placed with 1-6. A +1 on an
+/// even score leaves the modifier where it is, and the row says so rather
+/// than let the player wonder why nothing moved. The screen holds every key
+/// until the point is placed, so all six choices must be in view: the full
+/// layout is five rows a score, and when `rows` (the area's height) cannot
+/// hold it every score collapses to one line.
+fn score_point_lines(view: &PlayerView, rows: u16) -> Vec<Line<'static>> {
+    const HEADER_ROWS: usize = 4;
+    const ROWS_PER_SCORE: usize = 5;
+    let full = HEADER_ROWS + ROWS_PER_SCORE * view.score_offer.len();
+    if full > usize::from(rows) {
+        return score_point_lines_compact(view);
+    }
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "~ YOU GROW ~",
+            Style::default()
+                .fg(theme::AMBER_GLOW())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Level {} - {} attribute point(s) to place. Modifier = (score-10)/2; scores cap at {SCORE_CAP}.",
+                view.level, view.score_points
+            ),
+            Style::default().fg(theme::TEXT_DIM()),
+        )),
+        Line::from(Span::styled(
+            "Press 1-6 to place a point.",
+            Style::default().fg(theme::TEXT_DIM()),
+        )),
+        Line::raw(""),
+    ];
+    for (i, row) in view.score_offer.iter().enumerate() {
+        let sign = if row.modifier >= 0 { "+" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", i + 1), Style::default().fg(theme::AMBER())),
+            Span::styled(
+                format!("{} {} ({sign}{}) ", row.label, row.value, row.modifier),
+                Style::default()
+                    .fg(theme::TEXT_BRIGHT())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("· {}", row.name),
+                Style::default().fg(theme::AMBER_DIM()),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("      now: {}", row.now),
+            Style::default().fg(theme::TEXT()),
+        )));
+        let after = match &row.after {
+            Some(after) if after == &row.now => format!(
+                "      +1 -> {}: {after} (the modifier moves at {})",
+                row.value + 1,
+                row.value + 2
+            ),
+            Some(after) => format!("      +1 -> {}: {after}", row.value + 1),
+            None => format!("      at the cap of {SCORE_CAP}"),
+        };
+        lines.push(Line::from(Span::styled(
+            after,
+            Style::default().fg(theme::SUCCESS()),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("      {}", row.rule),
+            Style::default().fg(theme::TEXT_DIM()),
+        )));
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+/// The point screen for a short terminal: one line a score, now -> after.
+fn score_point_lines_compact(view: &PlayerView) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "~ YOU GROW ~ ",
+                Style::default()
+                    .fg(theme::AMBER_GLOW())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "Level {} - {} attribute point(s) to place. Press 1-6 to place a point (scores cap at {SCORE_CAP}).",
+                    view.level, view.score_points
+                ),
+                Style::default().fg(theme::TEXT_DIM()),
+            ),
+        ]),
+        Line::raw(""),
+    ];
+    for (i, row) in view.score_offer.iter().enumerate() {
+        let sign = if row.modifier >= 0 { "+" } else { "" };
+        let after = match &row.after {
+            Some(after) if after == &row.now => format!("-> the same until {}", row.value + 2),
+            Some(after) => format!("-> {after}"),
+            None => format!("at the cap of {SCORE_CAP}"),
+        };
+        let mut spans = vec![
+            Span::styled(format!("  {} ", i + 1), Style::default().fg(theme::AMBER())),
+            Span::styled(
+                format!("{} {} ({sign}{}) ", row.label, row.value, row.modifier),
+                Style::default()
+                    .fg(theme::TEXT_BRIGHT())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if row.after.is_some() {
+            spans.push(Span::styled(
+                format!("{} ", row.now),
+                Style::default().fg(theme::TEXT()),
+            ));
+        }
+        spans.push(Span::styled(after, Style::default().fg(theme::SUCCESS())));
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// The level-10 archetype crossroads: two permanent paths, picked with 1/2.
@@ -3949,6 +4125,16 @@ fn sheet_derived(view: &PlayerView, accent: Color) -> Vec<Line<'static>> {
         theme::SUCCESS(),
     ));
     lines.push(stat_colored(
+        "swing",
+        format!("+{}", view.swing),
+        theme::SUCCESS(),
+    ));
+    lines.push(stat_colored(
+        "spell",
+        format!("+{}", view.spell_power),
+        theme::SUCCESS(),
+    ));
+    lines.push(stat_colored(
         "armor",
         view.armor.to_string(),
         theme::MENTION(),
@@ -4366,6 +4552,8 @@ fn character_panel(view: &PlayerView) -> Vec<Line<'static>> {
     lines.push(Line::raw(""));
     lines.push(section("Combat"));
     lines.push(stat("attack", view.attack.to_string()));
+    lines.push(stat("swing", view.swing.to_string()));
+    lines.push(stat("spell", view.spell_power.to_string()));
     lines.push(stat("armor", view.armor.to_string()));
     lines.push(Line::raw(""));
     lines.extend(attribute_lines(

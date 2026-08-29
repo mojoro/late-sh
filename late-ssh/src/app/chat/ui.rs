@@ -1,4 +1,6 @@
 use chrono::{DateTime, Utc};
+use late_core::models::article::NEWS_SHARE_REWARD_CHIPS;
+use late_core::models::chat_message_gild::ChatMessageGildSummary;
 use late_core::models::chat_message_reaction::ChatMessageReactionSummary;
 use late_core::models::chat_poll::{ActiveChatPoll, ChatPollOptionSummary};
 use late_core::models::{
@@ -21,10 +23,11 @@ use uuid::Uuid;
 
 use crate::app::common::{
     composer::composer_line_count,
+    mentions::mentions_user,
     overlay::{Overlay, draw_overlay},
     primitives::row_with_hint,
     theme,
-    username_effect::NameStyle,
+    username_effect::{CROWN_GLYPH, ResolvedName},
 };
 use crate::app::files::{
     inline_image::InlineImagePreview,
@@ -37,16 +40,20 @@ use crate::usernames::UsernameLookup;
 
 use super::state::{
     MentionMatch, ROOM_JUMP_KEYS, RoomSection, RoomSlot, RoomVisualOrderInput,
-    SelectedRoomSlotState, TranslationDisplay, compare_dm_rooms_for_nav, dm_is_promoted_unread,
-    dm_peer_is_ignored, is_chat_list_room, is_selected_slot, visual_order_for_rooms,
+    SelectedRoomSlotState, SelectionScroll, TranslationDisplay, compare_dm_rooms_for_nav,
+    dm_is_promoted_unread, dm_peer_is_ignored, is_chat_list_room, is_selected_slot,
+    visual_order_for_rooms,
 };
-use super::ui_text::{AuthorTint, reaction_label, wrap_chat_entry_to_lines};
+use super::ui_text::{AuthorTint, Gutter, reaction_label, wrap_chat_entry_to_lines};
 
 const REACTION_PICKER_KEYS: [i16; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 /// The gap between messages and composer: a blank breather row on top so the
 /// ticker doesn't read as one more chat line, then the ticker row itself
 /// hugging the composer. Two rows, always present, so the chrome never moves.
 const CHAT_COMPOSER_GAP_HEIGHT: u16 = 2;
+/// Below this the poll question is unreadable, so the author byline goes
+/// instead: the question is what people need to answer.
+const MIN_POLL_QUESTION_CELLS: usize = 12;
 const AUTHOR_BADGE_SEPARATOR: &str = " ";
 const FRIEND_BADGE: &str = "★";
 const AFK_BADGE: &str = "🌙";
@@ -94,6 +101,7 @@ pub struct DashboardChatView<'a> {
     /// Users whose stream is on air; painted as the LIVE presence tag.
     pub live_user_ids: &'a HashSet<Uuid>,
     pub message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
+    pub message_gilds: &'a HashMap<Uuid, ChatMessageGildSummary>,
     pub unread_marker: Option<DateTime<Utc>>,
     pub current_user_id: Uuid,
     pub voice_channel_id: Option<Uuid>,
@@ -118,7 +126,7 @@ pub struct DashboardChatView<'a> {
     pub drunk_levels: &'a HashMap<Uuid, u8>,
     /// Resolved 24h username-effect styles per author (see
     /// `common/username_effect.rs`); fg painted over the bare name only.
-    pub name_styles: &'a HashMap<Uuid, NameStyle>,
+    pub name_flair: &'a HashMap<Uuid, ResolvedName>,
     /// Per-peer `/pomodoro` badges (countdown only, resolved once a second in
     /// `tick.rs`); painted as a presence badge after AFK.
     pub peer_pomodoros: &'a HashMap<Uuid, String>,
@@ -138,6 +146,9 @@ pub struct DashboardChatView<'a> {
     /// layout so `app::input` can map clicks in the message area to a
     /// message id, header segment, or inline-image row.
     pub(crate) chat_hit_slot: Option<&'a std::cell::Cell<Option<ChatHitLayout>>>,
+    /// Row offset inside a selected too-tall message, plus the overflow
+    /// measurement written back for the input layer.
+    pub selection_scroll: Option<&'a SelectionScroll>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -435,7 +446,7 @@ fn empty_composer_placeholder(view: &ComposerBlockView<'_>, width: usize) -> Par
         ))]
     } else if view.selected_message {
         vec![Line::from(Span::styled(
-            "f react · r reply · e edit · d delete · p profile · c copy · t translate · Enter jump to reply",
+            "f react · r reply · e edit · d delete · g gild · p profile · t translate · Enter jump to reply",
             dim,
         ))]
     } else {
@@ -787,17 +798,27 @@ fn draw_poll_strip(frame: &mut Frame, area: Rect, poll: &ActiveChatPoll) {
         .iter()
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
         .sum();
-    // Reserve the meta title, the " Poll · " + trailing-space chrome (9
-    // cells), and a 1-cell gap so a long question never collides with the
-    // right-aligned countdown.
-    let question_budget = inner_width.saturating_sub(meta_width + 10).max(4);
-    let question = truncate_cells(poll.poll.question.as_str(), question_budget);
-    let title_left = Line::from(vec![Span::styled(
-        format!(" Poll · {question} "),
-        Style::default()
-            .fg(theme::TEXT_BRIGHT())
-            .add_modifier(Modifier::BOLD),
-    )]);
+    let (question, byline) = poll_title_parts(
+        poll.poll.question.as_str(),
+        poll.author_username.as_deref(),
+        meta_width,
+        inner_width,
+    );
+    let title_left = Line::from(vec![
+        Span::styled(
+            format!(" Poll · {question}"),
+            Style::default()
+                .fg(theme::TEXT_BRIGHT())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(byline, Style::default().fg(theme::TEXT_DIM())),
+        Span::styled(
+            " ",
+            Style::default()
+                .fg(theme::TEXT_BRIGHT())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -895,6 +916,35 @@ fn format_poll_remaining(secs: i64) -> String {
     } else {
         format!("{}h", (secs + 3599) / 3600)
     }
+}
+
+/// Split the poll strip's left title into the (possibly truncated) question and
+/// the author byline, given the width the right-aligned countdown already took.
+///
+/// The byline says who started the poll, so it is answerable to someone rather
+/// than arriving out of nowhere (user feedback). It is the half that gets
+/// dropped when the strip cannot carry both: the question is what people have
+/// to read in order to vote.
+fn poll_title_parts(
+    question: &str,
+    author: Option<&str>,
+    meta_width: usize,
+    inner_width: usize,
+) -> (String, String) {
+    // Reserve the meta title, the " Poll · " + trailing-space chrome (9
+    // cells), and a 1-cell gap so a long question never collides with the
+    // right-aligned countdown.
+    let chrome_width = meta_width + 10;
+    let byline = author
+        .map(|author| format!(" · @{author}"))
+        .unwrap_or_default();
+    let with_byline =
+        inner_width.saturating_sub(chrome_width + UnicodeWidthStr::width(byline.as_str()));
+    if !byline.is_empty() && with_byline >= MIN_POLL_QUESTION_CELLS {
+        return (truncate_cells(question, with_byline), byline);
+    }
+    let budget = inner_width.saturating_sub(chrome_width).max(4);
+    (truncate_cells(question, budget), String::new())
 }
 
 fn poll_stat_text(count: i64, total: i64) -> String {
@@ -1146,10 +1196,11 @@ pub fn draw_dashboard_chat_card(
                 chat_badges: view.chat_badges,
                 profile_award_badges: view.profile_award_badges,
                 message_reactions: view.message_reactions,
+                message_gilds: view.message_gilds,
                 inline_images: view.inline_images,
                 unread_marker: view.unread_marker,
                 drunk_levels: view.drunk_levels,
-                name_styles: view.name_styles,
+                name_flair: view.name_flair,
                 peer_pomodoros: view.peer_pomodoros,
                 translations: view.translations,
                 translation_hidden: view.translation_hidden,
@@ -1160,6 +1211,7 @@ pub fn draw_dashboard_chat_card(
             view.selected_message_id,
             view.highlighted_message_id,
             height,
+            view.selection_scroll,
         );
         lines = visible.lines;
         chat_hits = Some(visible.hits);
@@ -1234,12 +1286,13 @@ struct ChatRowsContext<'a> {
     chat_badges: &'a HashMap<Uuid, String>,
     profile_award_badges: &'a HashMap<Uuid, String>,
     message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
+    message_gilds: &'a HashMap<Uuid, ChatMessageGildSummary>,
     inline_images: &'a HashMap<Uuid, InlineImagePreview>,
     unread_marker: Option<DateTime<Utc>>,
     /// Per-author drunk levels (1-4) for the tavern glow under usernames.
     drunk_levels: &'a HashMap<Uuid, u8>,
     /// Resolved 24h username-effect styles per author.
-    name_styles: &'a HashMap<Uuid, NameStyle>,
+    name_flair: &'a HashMap<Uuid, ResolvedName>,
     peer_pomodoros: &'a HashMap<Uuid, String>,
     translations: &'a HashMap<Uuid, TranslationDisplay>,
     translation_hidden: &'a HashSet<Uuid>,
@@ -1269,6 +1322,9 @@ pub(crate) enum HeaderTarget {
     /// The currently equipped chat flag. Resolves to the Hub Shop opened
     /// on the Flags sub-store.
     StoreFlag,
+    /// The dearest burn milestone this author owns. Resolves to the Hub Shop
+    /// opened on the Ultimates sub-store, where the ladder is sold.
+    StoreMilestone,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1401,44 +1457,45 @@ fn chat_rows_cache_key(ctx: &ChatRowsContext<'_>, width: usize) -> ChatRowsCache
     }
 }
 
+/// The `new messages` rule, one builder for every surface (live tail,
+/// history modal) so the styles cannot drift. Heavy rule in the accent
+/// colour, not a dim light one: the unread boundary is the row people scan
+/// for, and the old faint `─` lost itself among the message bodies (user
+/// feedback).
+pub(crate) fn new_messages_divider_line(width: usize) -> Line<'static> {
+    let label = " new messages ";
+    let rule_width = width.saturating_sub(label.len()).max(2);
+    let left = rule_width / 2;
+    let right = rule_width.saturating_sub(left);
+    let style = Style::default().fg(theme::AMBER());
+    Line::from(vec![
+        Span::styled("━".repeat(left), style),
+        Span::styled(label, style.add_modifier(Modifier::BOLD)),
+        Span::styled("━".repeat(right), style),
+    ])
+}
+
 fn push_new_messages_divider(
     rows: &mut Vec<Line<'static>>,
     row_message: &mut Vec<Option<Uuid>>,
     row_kind: &mut Vec<RowKindLite>,
     width: usize,
 ) {
-    let label = " new messages ";
-    let rule_width = width.saturating_sub(label.len()).max(2);
-    let left = rule_width / 2;
-    let right = rule_width.saturating_sub(left);
-    let style = Style::default().fg(theme::TEXT_DIM());
-    rows.push(Line::from(vec![
-        Span::styled("─".repeat(left), style),
-        Span::styled(label, style.add_modifier(Modifier::BOLD)),
-        Span::styled("─".repeat(right), style),
-    ]));
+    rows.push(new_messages_divider_line(width));
     row_message.push(None);
     row_kind.push(RowKindLite::Blank);
 }
 
+/// Whether the `new messages` divider goes above `message`: the first
+/// message from someone else since this session's human went quiet. Your own
+/// messages never trip it, and posting one clears the line outright, so the
+/// divider can only ever sit above somebody else's words.
 fn is_unread_boundary_message(
     marker: Option<DateTime<Utc>>,
     message: &ChatMessage,
     current_user_id: Uuid,
 ) -> bool {
     marker.is_some_and(|marker| message.created > marker && message.user_id != current_user_id)
-}
-
-/// Whether `body` mentions `username_lower`. Uses the same mention parser as
-/// the notification path, so `@Alice` matches the user `alice`, `@alicebob`
-/// does not, and a mention inside a code span does not count.
-fn mentions_user(body: &str, username_lower: Option<&str>) -> bool {
-    let Some(username_lower) = username_lower else {
-        return false;
-    };
-    crate::app::common::mentions::extract_mentions(body)
-        .iter()
-        .any(|mentioned| mentioned == username_lower)
 }
 
 /// Whether `message` is a reply to a message written by `user_id`. Human
@@ -1495,15 +1552,20 @@ fn ensure_chat_rows_cache(
 
     for msg in messages.into_iter().rev() {
         let is_own = msg.user_id == ctx.current_user_id;
+        // A bumped `updated` marks a message that's been edited; there is no
+        // dedicated edited flag.
+        let is_edited = msg.updated > msg.created;
+        // An edit always breaks the run. "(edited)" rides in the author
+        // header's stamp and a continuation has no header, so grouping an
+        // edited message under the one above it hid the marker completely.
         let is_continuation = prev_user_id == Some(msg.user_id)
+            && !is_edited
             && prev_created.is_some_and(|prev| (msg.created - prev).num_seconds().abs() < 120);
         let mut stamp = format!(
             "[{}]",
             crate::app::common::primitives::format_relative_time(msg.created)
         );
-        // A bumped `updated` marks a message that's been edited; there is no
-        // dedicated edited flag.
-        if msg.updated > msg.created {
+        if is_edited {
             stamp.push_str(" (edited)");
         }
         let raw_author = ctx
@@ -1571,22 +1633,38 @@ fn ensure_chat_rows_cache(
         if let Some(badge) = ctx.peer_pomodoros.get(&msg.user_id) {
             presence_badges.push(badge);
         }
-        let (prefix, segments, author_range) = build_author_prefix_and_segments_with_chat_badges(
+        let flair = ctx.name_flair.get(&msg.user_id);
+        let AuthorPrefix {
+            prefix,
+            segments,
+            author_range,
+            crown_range,
+            title_range,
+        } = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
             is_friend,
-            &author,
-            special_list,
-            &chat_badge_refs,
-            bonsai_opt,
+            author: &author,
+            crown: flair.is_some_and(|flair| flair.crown),
+            title: flair.and_then(|flair| flair.title.as_deref()),
+            milestone: flair.and_then(|flair| flair.milestone.as_deref()),
+            special_badges: special_list,
+            chat_badges: &chat_badge_refs,
+            bonsai_glyph: bonsai_opt,
             profile_award_badges,
-            &presence_badges,
-        );
+            presence_badges: &presence_badges,
+        });
         let drunk_word = ctx.drunk_levels.get(&msg.user_id).and_then(|level| {
             late_core::models::drinks::drunk_label_word(*level)
                 .map(|word| (word, theme::DRUNK_WORD_FG(*level)))
         });
-        let name_style = ctx.name_styles.get(&msg.user_id).copied();
-        let author_tint = (drunk_word.is_some() || name_style.is_some()).then_some(AuthorTint {
+        let name_style = flair.and_then(|flair| flair.style);
+        let author_tint = (drunk_word.is_some()
+            || name_style.is_some()
+            || crown_range.is_some()
+            || title_range.is_some())
+        .then_some(AuthorTint {
             range: author_range,
+            crown_range,
+            title_range,
             word: drunk_word,
             name_style,
         });
@@ -1596,6 +1674,7 @@ fn ensure_chat_rows_cache(
             .get(&msg.id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let gild = ctx.message_gilds.get(&msg.id).copied();
 
         // A reply is checked before a mention because the composer prepends a
         // `> @author: …` quote line to every reply, which would otherwise make
@@ -1655,6 +1734,7 @@ fn ensure_chat_rows_cache(
             system_text,
             image_lines,
             reactions,
+            gild,
             translation,
         );
         let line_count = wrapped.lines.len();
@@ -1737,6 +1817,7 @@ fn visible_chat_rows(
     selected_message_id: Option<Uuid>,
     highlighted_message_id: Option<Uuid>,
     height: usize,
+    selection_scroll: Option<&SelectionScroll>,
 ) -> VisibleChatRows {
     let total_rows = cache.all_rows.len();
     if total_rows == 0 {
@@ -1751,7 +1832,16 @@ fn visible_chat_rows(
     let highlighted_row_range =
         highlighted_message_id.and_then(|id| cache.highlighted_ranges.get(&id).copied());
     let focus_range = selected_row_range.or(highlighted_row_range);
-    let scroll = effective_chat_scroll(total_rows, height, focus_range);
+    let offset = selection_scroll.map_or(0, |cells| cells.rows.get());
+    let (scroll, overflow) = effective_chat_scroll(total_rows, height, focus_range, offset);
+    if let Some(cells) = selection_scroll {
+        // Publish this frame's measurement for the input layer, and pull a
+        // stale offset back inside a range a resize or rewrap just shrank.
+        cells.overflow.set(overflow);
+        if cells.rows.get() > overflow {
+            cells.rows.set(overflow);
+        }
+    }
     let visible_end = total_rows.saturating_sub(scroll);
     let visible_start = visible_end.saturating_sub(height);
     let mut lines = cache.all_rows[visible_start..visible_end].to_vec();
@@ -1833,7 +1923,7 @@ fn visible_chat_rows(
         for idx in start..end {
             let row = &mut lines[idx - visible_start];
             if let Some(first_span) = row.spans.first()
-                && (first_span.content == " " || first_span.content == "│")
+                && Gutter::is_glyph(&first_span.content)
             {
                 // Keep the row's whole treatment (the mention or reply wash,
                 // or the highlight inversion), so the marker does not punch
@@ -2079,36 +2169,54 @@ fn line_display_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
+/// Where the chat viewport sits, derived from the focused message. Returns
+/// `(scroll, overflow)`: `scroll` counts rows hidden below the viewport
+/// (0 = bottom-anchored), and `overflow` is how many more rows of a
+/// focused message taller than the pane can still be walked into view by
+/// `selection_offset` (0 whenever the focus fits). The caller publishes
+/// `overflow` back to `ChatState::selection_scroll` so `j`/`k` know when
+/// to scroll rows instead of moving the selection.
 fn effective_chat_scroll(
     total_rows: usize,
     height: usize,
     selected_row_range: Option<(usize, usize)>,
-) -> usize {
+    selection_offset: usize,
+) -> (usize, usize) {
     const SELECTED_SCROLL_MARGIN: usize = 2;
 
     let max_scroll = total_rows.saturating_sub(height);
-    let scroll = 0;
 
     let Some((start, end)) = selected_row_range else {
-        return scroll;
+        return (0, 0);
     };
 
-    let visible_end = total_rows.saturating_sub(scroll);
+    let visible_end = total_rows;
     let visible_start = visible_end.saturating_sub(height);
     let selected_end = end.min(total_rows);
     let selected_len = selected_end.saturating_sub(start);
     let margin = SELECTED_SCROLL_MARGIN.min(height.saturating_sub(1) / 2);
 
-    let target_end = if selected_len >= height || start < visible_start {
+    let (target_end, overflow) = if selected_len >= height {
+        // Taller than the pane: pin the top, then let the row offset walk
+        // the rest of the message (plus the usual margin) into view.
         let target_start = start.saturating_sub(margin);
-        (target_start + height).min(total_rows)
+        let base_end = (target_start + height).min(total_rows);
+        let max_end = (selected_end + margin).min(total_rows);
+        let overflow = max_end.saturating_sub(base_end);
+        ((base_end + selection_offset.min(overflow)), overflow)
+    } else if start < visible_start {
+        let target_start = start.saturating_sub(margin);
+        ((target_start + height).min(total_rows), 0)
     } else if selected_end > visible_end.saturating_sub(margin) {
-        (selected_end + margin).min(total_rows)
+        ((selected_end + margin).min(total_rows), 0)
     } else {
-        visible_end
+        (visible_end, 0)
     };
 
-    total_rows.saturating_sub(target_end).min(max_scroll)
+    (
+        total_rows.saturating_sub(target_end).min(max_scroll),
+        overflow,
+    )
 }
 
 /// Scroll the rooms sidebar so the selected row lands near the vertical
@@ -2265,8 +2373,9 @@ fn subdivision_flag_prefix(badge: &str) -> Option<(&str, &str)> {
 /// Returned column ranges are relative to the start of the painted
 /// line, where column 0 is the leading pad cell (`" "` or `"│"`) and
 /// the prefix begins at column 1. Badges render in the canonical order:
-/// `[last-month awards]`, special badges, bonsai stage, equipped store
-/// badge, equipped flag, then AFK. Award badges, special badges, the
+/// `[last-month awards]`, special badges, bonsai stage, chat badge, chat
+/// flag, then AFK, with a rented title printed between the name and that
+/// stack. Award badges, special badges, the
 /// bonsai glyph, and the AFK badge map to `HeaderTarget::Profile`;
 /// equipped chat-shop badges map to `HeaderTarget::StoreBadge`, and
 /// equipped chat flags map to `HeaderTarget::StoreFlag`. The trailing
@@ -2286,27 +2395,68 @@ fn build_author_prefix_and_segments(
     if let Some(chat_badge) = chat_badge {
         chat_badges.push((HeaderTarget::StoreBadge, chat_badge));
     }
-    let (prefix, segments, _) = build_author_prefix_and_segments_with_chat_badges(
+    let built = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
         is_friend,
         author,
+        crown: false,
+        title: None,
+        milestone: None,
         special_badges,
-        &chat_badges,
+        chat_badges: &chat_badges,
         bonsai_glyph,
         profile_award_badges,
         presence_badges,
-    );
-    (prefix, segments)
+    });
+    (built.prefix, built.segments)
 }
 
-fn build_author_prefix_and_segments_with_chat_badges(
+/// Everything the author header prefix is painted from: one named field per
+/// decoration class, so a call site reads as a list of what the author is
+/// wearing rather than a run of positional arguments.
+struct AuthorPrefixInput<'a> {
     is_friend: bool,
-    author: &str,
-    special_badges: &[&str],
-    chat_badges: &[(HeaderTarget, &str)],
-    bonsai_glyph: Option<&str>,
-    profile_award_badges: Option<&str>,
-    presence_badges: &[&str],
-) -> (String, Vec<HeaderSegment>, (usize, usize)) {
+    author: &'a str,
+    /// Whether this author currently wears the crown.
+    crown: bool,
+    title: Option<&'a str>,
+    /// The dearest burn milestone this author owns. A badge, not a mark on
+    /// the name, so it joins the badge stack rather than trailing the
+    /// username the way the crown and title do.
+    milestone: Option<&'a str>,
+    special_badges: &'a [&'a str],
+    chat_badges: &'a [(HeaderTarget, &'a str)],
+    bonsai_glyph: Option<&'a str>,
+    profile_award_badges: Option<&'a str>,
+    presence_badges: &'a [&'a str],
+}
+
+/// The built author header prefix: the string, the clickable column
+/// segments, the bare username's byte range, and the byte ranges of the two
+/// decorations that trail it. The crown follows the username directly and
+/// the title follows the crown, so all three runs are adjacent and the
+/// painter can walk them in order.
+struct AuthorPrefix {
+    prefix: String,
+    segments: Vec<HeaderSegment>,
+    author_range: (usize, usize),
+    crown_range: Option<(usize, usize)>,
+    title_range: Option<(usize, usize)>,
+}
+
+/// Builds the author header prefix.
+fn build_author_prefix_and_segments_with_chat_badges(input: AuthorPrefixInput<'_>) -> AuthorPrefix {
+    let AuthorPrefixInput {
+        is_friend,
+        author,
+        crown,
+        title,
+        milestone,
+        special_badges,
+        chat_badges,
+        bonsai_glyph,
+        profile_award_badges,
+        presence_badges,
+    } = input;
     let mut prefix = String::new();
     let mut segments: Vec<HeaderSegment> = Vec::new();
     // The painted line is `[pad (1 cell)][prefix][ stamp]`, so prefix
@@ -2344,9 +2494,39 @@ fn build_author_prefix_and_segments_with_chat_badges(
     let author_range = (author_range_start, prefix.len());
     col += author_w;
 
+    // The crown follows the name after one space, ahead of the title and
+    // the badge stack: a mark on the person, not another badge. It carries
+    // no clickable segment of its own; the name beside it already opens the
+    // profile. The range starts at the space so it stays adjacent to the
+    // name for the painter, which walks the trailing runs in order.
+    let crown_range = crown.then(|| {
+        let crown_start = prefix.len();
+        prefix.push(' ');
+        prefix.push_str(CROWN_GLYPH);
+        col += 1 + UnicodeWidthStr::width(CROWN_GLYPH) as u16;
+        (crown_start, prefix.len())
+    });
+
+    // The rented title reads as an aside on the name (`mira, the
+    // insufferable`), so it sits between the name and the badge stack and is
+    // painted in the dim label color rather than taking the name's effect.
+    // It carries no clickable segment of its own; the name beside it already
+    // opens the profile.
+    let title_range = title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(|title| {
+            let title_start = prefix.len();
+            prefix.push_str(", ");
+            prefix.push_str(title);
+            col += UnicodeWidthStr::width(", ") as u16 + UnicodeWidthStr::width(title) as u16;
+            (title_start, prefix.len())
+        });
+
     let mut typed_badges: Vec<(HeaderTarget, &str)> = Vec::with_capacity(
         special_badges.len()
             + chat_badges.len()
+            + milestone.is_some() as usize
             + bonsai_glyph.is_some() as usize
             + profile_award_badges.is_some() as usize
             + presence_badges.len(),
@@ -2366,6 +2546,12 @@ fn build_author_prefix_and_segments_with_chat_badges(
     }
     for (target, s) in chat_badges.iter().copied().filter(|(_, s)| !s.is_empty()) {
         typed_badges.push((target, s));
+    }
+    // On top of the rentals, never in place of one: a rented badge and flag
+    // cost a hundred chips each and a milestone costs fifty thousand, so
+    // nothing a player rents may hide one.
+    if let Some(s) = milestone.filter(|s| !s.is_empty()) {
+        typed_badges.push((HeaderTarget::StoreMilestone, s));
     }
     for s in presence_badges.iter().copied().filter(|s| !s.is_empty()) {
         typed_badges.push((HeaderTarget::Profile, s));
@@ -2392,7 +2578,13 @@ fn build_author_prefix_and_segments_with_chat_badges(
         }
     }
 
-    (prefix, segments, author_range)
+    AuthorPrefix {
+        prefix,
+        segments,
+        author_range,
+        crown_range,
+        title_range,
+    }
 }
 
 /// Legacy badge-suffix formatter. Production code now builds the author
@@ -2561,8 +2753,11 @@ pub struct ChatRenderInput<'a> {
     pub countries: &'a HashMap<Uuid, String>,
     pub friend_user_ids: &'a HashSet<Uuid>,
     pub message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
+    pub message_gilds: &'a HashMap<Uuid, ChatMessageGildSummary>,
     pub inline_images: &'a HashMap<Uuid, InlineImagePreview>,
-    pub room_unread_markers: &'a HashMap<Uuid, Option<DateTime<Utc>>>,
+    /// This session's AFK line per room; the `new messages` divider
+    /// draws before the first message from someone else past it.
+    pub afk_lines: &'a HashMap<Uuid, DateTime<Utc>>,
     pub unread_counts: &'a HashMap<Uuid, i64>,
     pub room_last_message_at: &'a HashMap<Uuid, Option<DateTime<Utc>>>,
     pub favorite_room_ids: &'a [Uuid],
@@ -2600,7 +2795,7 @@ pub struct ChatRenderInput<'a> {
     pub drunk_levels: &'a HashMap<Uuid, u8>,
     /// Resolved 24h username-effect styles per author (see
     /// `common/username_effect.rs`); fg painted over the bare name only.
-    pub name_styles: &'a HashMap<Uuid, NameStyle>,
+    pub name_flair: &'a HashMap<Uuid, ResolvedName>,
     /// Per-peer `/pomodoro` badges (countdown only, resolved once a second in
     /// `tick.rs`); painted as a presence badge after AFK.
     pub peer_pomodoros: &'a HashMap<Uuid, String>,
@@ -2641,6 +2836,9 @@ pub struct ChatRenderInput<'a> {
     /// layout — only set in the real-room message branch (synthetic
     /// entries like Discover/News/Showcase don't produce one).
     pub(crate) chat_hit_slot: Option<&'a std::cell::Cell<Option<ChatHitLayout>>>,
+    /// Row offset inside a selected too-tall message, plus the overflow
+    /// measurement written back for the input layer.
+    pub selection_scroll: Option<&'a SelectionScroll>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2728,6 +2926,7 @@ pub struct EmbeddedRoomChatView<'a> {
     /// Users whose stream is on air; painted as the LIVE presence tag.
     pub live_user_ids: &'a HashSet<Uuid>,
     pub message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
+    pub message_gilds: &'a HashMap<Uuid, ChatMessageGildSummary>,
     pub inline_images: &'a HashMap<Uuid, InlineImagePreview>,
     pub unread_marker: Option<DateTime<Utc>>,
     pub current_user_id: Uuid,
@@ -2753,7 +2952,7 @@ pub struct EmbeddedRoomChatView<'a> {
     pub drunk_levels: &'a HashMap<Uuid, u8>,
     /// Resolved 24h username-effect styles per author (see
     /// `common/username_effect.rs`); fg painted over the bare name only.
-    pub name_styles: &'a HashMap<Uuid, NameStyle>,
+    pub name_flair: &'a HashMap<Uuid, ResolvedName>,
     /// Per-peer `/pomodoro` badges (countdown only, resolved once a second in
     /// `tick.rs`); painted as a presence badge after AFK.
     pub peer_pomodoros: &'a HashMap<Uuid, String>,
@@ -2770,6 +2969,9 @@ pub struct EmbeddedRoomChatView<'a> {
     /// layout (with `content` set to the painted text area, not the
     /// bordered frame).
     pub(crate) chat_hit_slot: Option<&'a std::cell::Cell<Option<ChatHitLayout>>>,
+    /// Row offset inside a selected too-tall message, plus the overflow
+    /// measurement written back for the input layer.
+    pub selection_scroll: Option<&'a SelectionScroll>,
 }
 
 pub fn draw_embedded_room_chat(
@@ -2846,10 +3048,11 @@ pub fn draw_embedded_room_chat(
             chat_badges: view.chat_badges,
             profile_award_badges: view.profile_award_badges,
             message_reactions: view.message_reactions,
+            message_gilds: view.message_gilds,
             inline_images: view.inline_images,
             unread_marker: view.unread_marker,
             drunk_levels: view.drunk_levels,
-            name_styles: view.name_styles,
+            name_flair: view.name_flair,
             peer_pomodoros: view.peer_pomodoros,
             translations: view.translations,
             translation_hidden: view.translation_hidden,
@@ -2860,6 +3063,7 @@ pub fn draw_embedded_room_chat(
         view.selected_message_id,
         view.highlighted_message_id,
         height,
+        view.selection_scroll,
     );
     let chat_hits = visible.hits;
     let lines = if visible.lines.is_empty() {
@@ -3846,8 +4050,7 @@ fn build_cozy_room_rail_rows(view: &ChatRoomListView<'_>, width: u16) -> RoomLis
                     unread: i64,
                     badge: String,
                     active: bool,
-                    jump_key: Option<u8>,
-                    effects: &[ActiveChatRoomEffect]|
+                    jump_key: Option<u8>|
      -> Line<'static> {
         let key_prefix = if view.room_jump_active {
             jump_key
@@ -3856,8 +4059,6 @@ fn build_cozy_room_rail_rows(view: &ChatRoomListView<'_>, width: u16) -> RoomLis
         } else {
             String::new()
         };
-        let effect_suffix = room_effect_suffix(effects);
-        let label = format!("{label}{effect_suffix}");
         let key_width = UnicodeWidthStr::width(key_prefix.as_str());
         let label_max = inner_width.saturating_sub(key_width + 4);
         let display_label = if UnicodeWidthStr::width(label.as_str()) > label_max && label_max > 1 {
@@ -3886,14 +4087,12 @@ fn build_cozy_room_rail_rows(view: &ChatRoomListView<'_>, width: u16) -> RoomLis
         }
         let name_color = if active {
             theme::AMBER()
-        } else if has_room_effect(effects, "pinned_vibe") {
-            theme::AMBER_GLOW()
         } else if unread > 0 {
             theme::TEXT()
         } else {
             theme::TEXT_DIM()
         };
-        let name_modifier = if active || has_room_effect(effects, "pinned_vibe") {
+        let name_modifier = if active {
             Modifier::BOLD
         } else {
             Modifier::empty()
@@ -3924,7 +4123,6 @@ fn build_cozy_room_rail_rows(view: &ChatRoomListView<'_>, width: u16) -> RoomLis
             let active = cozy_slot_selected(view, slot);
             let (label, unread) = room_slot_label_and_unread(view, slot);
             let badge = room_slot_badge(view, slot, unread);
-            let effects = room_slot_effects(view, slot);
             push_row(
                 item_row(
                     label,
@@ -3932,7 +4130,6 @@ fn build_cozy_room_rail_rows(view: &ChatRoomListView<'_>, width: u16) -> RoomLis
                     badge,
                     active,
                     jump_targets.get(&slot).copied(),
-                    effects,
                 ),
                 Some(slot),
                 active,
@@ -4262,36 +4459,10 @@ fn bumped_join_room_slugs(
     slugs
 }
 
-fn room_slot_effects<'a>(
-    view: &'a ChatRoomListView<'_>,
-    slot: RoomSlot,
-) -> &'a [ActiveChatRoomEffect] {
-    match slot {
-        RoomSlot::Room(room_id) => view
-            .active_room_effects
-            .get(&room_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]),
-        _ => &[],
-    }
-}
-
 fn has_room_effect(effects: &[ActiveChatRoomEffect], effect_kind: &str) -> bool {
     effects
         .iter()
         .any(|effect| effect.effect_kind == effect_kind)
-}
-
-fn room_effect_suffix(effects: &[ActiveChatRoomEffect]) -> String {
-    if let Some(vibe) = effects
-        .iter()
-        .find(|effect| effect.effect_kind == "pinned_vibe")
-        .and_then(|effect| effect.vibe.as_deref())
-    {
-        format!(" {vibe}")
-    } else {
-        String::new()
-    }
 }
 
 fn room_display_label(
@@ -4708,10 +4879,11 @@ fn draw_selected_content(
                     chat_badges: view.chat_badges,
                     profile_award_badges: view.profile_award_badges,
                     message_reactions: view.message_reactions,
+                    message_gilds: view.message_gilds,
                     inline_images: view.inline_images,
-                    unread_marker: view.room_unread_markers.get(&room.id).copied().flatten(),
+                    unread_marker: view.afk_lines.get(&room.id).copied(),
                     drunk_levels: view.drunk_levels,
-                    name_styles: view.name_styles,
+                    name_flair: view.name_flair,
                     peer_pomodoros: view.peer_pomodoros,
                     translations: view.translations,
                     translation_hidden: view.translation_hidden,
@@ -4722,6 +4894,7 @@ fn draw_selected_content(
                 view.selected_message_id,
                 view.highlighted_message_id,
                 height,
+                view.selection_scroll,
             );
             chat_hits = Some(visible.hits);
 
@@ -4773,8 +4946,9 @@ fn draw_selected_content(
             .block(hint_block);
             frame.render_widget(hint_text, composer_area);
         } else {
+            let rss_title = format!(" RSS · a share pays {NEWS_SHARE_REWARD_CHIPS} chips ");
             let hint_block = Block::default()
-                .title(" RSS ")
+                .title(rss_title.as_str())
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::BORDER()));
             let hint_text = Paragraph::new(Line::from(Span::styled(
@@ -4900,10 +5074,16 @@ fn draw_selected_content(
                 .title(" Discover ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::BORDER()));
-            let hint_text = Paragraph::new(Line::from(Span::styled(
-                " j/k navigate · Enter join room · / filter",
-                Style::default().fg(theme::TEXT_DIM()),
-            )))
+            let hint_text = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " j/k navigate · Enter join room · / filter · s sort by ",
+                    Style::default().fg(theme::TEXT_DIM()),
+                ),
+                Span::styled(
+                    view.discover_view.sort.label(),
+                    Style::default().fg(theme::AMBER()),
+                ),
+            ]))
             .block(hint_block);
             frame.render_widget(hint_text, composer_area);
         }
@@ -4916,7 +5096,9 @@ fn draw_selected_content(
                 )
             } else {
                 (
-                    " Paste URL (Enter submit, Esc cancel) ".to_string(),
+                    format!(
+                        " Paste URL · Enter submit, Esc cancel · +{NEWS_SHARE_REWARD_CHIPS} chips "
+                    ),
                     Style::default().fg(theme::BORDER_ACTIVE()),
                 )
             };
@@ -4929,8 +5111,9 @@ fn draw_selected_content(
             let text_area = horizontal_inset(news_inner, 1);
             frame.render_widget(view.news_composer, text_area);
         } else {
+            let share_title = format!(" Share URL · +{NEWS_SHARE_REWARD_CHIPS} chips ");
             let hint_block = Block::default()
-                .title(" Share URL ")
+                .title(share_title.as_str())
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::BORDER()));
             let hint_text = Paragraph::new(Line::from(Span::styled(

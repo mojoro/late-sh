@@ -59,10 +59,72 @@ pub enum ActivityKind {
         game: String,
         match_id: Uuid,
     },
-    /// A bought 24h username effect went live ("mat is glowing (24h)").
-    /// Shown in #lounge: the whole point of the purchase is being seen.
+    /// A bought username effect went live ("mat is glowing (24h)"). Shown in
+    /// #lounge: the whole point of the purchase is being seen.
     UsernameEffectApplied {
         effect: late_core::models::username_effect::UsernameEffect,
+    },
+    /// A rented chat badge or flag went live ("mat rented 🐱 (24h)"). Same
+    /// reasoning as the username effect: it is bought to be seen next to the
+    /// name in every message.
+    BadgeRented {
+        emoji: String,
+    },
+    /// A rented title went live ("mat is now the insufferable (30d)"). The
+    /// most be-seen thing the Shop sells, so it announces.
+    TitleApplied {
+        title: String,
+    },
+    /// Someone burned a six-figure sum for a permanent glyph ("mira burned
+    /// 150,000 chips for the Fuse"). The badge is the receipt, so the line
+    /// names the price: everyone watching is the product.
+    BurnMilestone {
+        name: String,
+        price: i64,
+    },
+    /// A chat message reached the gild threshold. Names the author only: the
+    /// buyers stay out of it, because the story is that a room paid for
+    /// something someone said, not who has chips. `message_id` keys the
+    /// #lounge repeat throttle, the way `DailyResult` keys on its match, so
+    /// two of one author's messages crossing the line in the same half hour
+    /// both post.
+    MessageGilded {
+        message_id: Uuid,
+        count: i64,
+        room_slug: Option<String>,
+    },
+    /// Someone took the crown. Both players are named because that is the
+    /// whole story: a takeover is one person outbidding another in public.
+    /// `reign_id` keys the #lounge repeat throttle, so back-to-back
+    /// takeovers each post (the 1.5x price ladder is the real throttle).
+    CrownTaken {
+        reign_id: Uuid,
+        price: i64,
+        /// What the next take costs, so the #lounge headline can quote it
+        /// without every reader re-deriving the ladder.
+        next_price: i64,
+        /// The deposed holder, absent when the crown was vacant.
+        from: Option<String>,
+    },
+    /// Someone bought the house a round. The buyer is the whole story, so the
+    /// line names them and the size of their gesture, never the patrons who
+    /// got a drink out of it. `round_id` keys the #lounge repeat throttle;
+    /// a second round minutes later reaches almost nobody and refuses, so
+    /// there is nothing to collapse.
+    RoundBought {
+        round_id: Uuid,
+        patrons: i64,
+        total_chips: i64,
+    },
+    /// The weekly pot drew. Names the winner and the odds they beat, because
+    /// the odds are the story: a three-ticket win off three hundred reads
+    /// very differently from a fifty-ticket one. `pot_id` keys the #lounge
+    /// repeat throttle; there is one of these a week anyway.
+    PotDrawn {
+        pot_id: Uuid,
+        payout: i64,
+        winner_tickets: i64,
+        total_tickets: i64,
     },
     /// A linked user published an entry on cyberspace.online from late.sh.
     /// Announces our user's own action, never cyberspace content.
@@ -96,6 +158,13 @@ impl ActivityKind {
         match self {
             Self::UserJoined
             | Self::UsernameEffectApplied { .. }
+            | Self::BadgeRented { .. }
+            | Self::TitleApplied { .. }
+            | Self::BurnMilestone { .. }
+            | Self::MessageGilded { .. }
+            | Self::CrownTaken { .. }
+            | Self::RoundBought { .. }
+            | Self::PotDrawn { .. }
             | Self::CyberspacePosted { .. }
             | Self::WentLive { .. }
             | Self::WatchingStream { .. } => ActivityCategory::Session,
@@ -371,25 +440,208 @@ impl ActivityEvent {
         )
     }
 
-    /// A bought 24h username effect went live. The action names the style,
-    /// not the color: "is glowing (24h)" reads as a story, and the name
-    /// itself shows the color everywhere it renders.
+    /// A bought username effect went live. The action names the style, not
+    /// the color: "is glowing (24h)" reads as a story, and the name itself
+    /// shows the color everywhere it renders. The tag carries the bought
+    /// tier's window, so a month purchase reads "(30d)".
     pub fn username_effect_applied(
         user_id: Uuid,
         username: impl Into<String>,
         effect: late_core::models::username_effect::UsernameEffect,
+        duration_secs: i64,
     ) -> Self {
+        use late_core::models::rental::duration_tag;
         use late_core::models::username_effect::UsernameEffect;
-        let action = match effect {
-            UsernameEffect::Glow(_) => "is glowing (24h)",
-            UsernameEffect::Gradient(_) => "went gradient (24h)",
-            UsernameEffect::Shimmer => "is shimmering (24h)",
+        let style = match effect {
+            UsernameEffect::Glow(_) => "is glowing",
+            UsernameEffect::Gradient(_) => "went gradient",
+            UsernameEffect::Shimmer => "is shimmering",
         };
         Self::new(
             Some(user_id),
             username,
             ActivityKind::UsernameEffectApplied { effect },
-            action.to_string(),
+            format!("{style} ({})", duration_tag(duration_secs)),
+        )
+    }
+
+    /// A rented chat badge went live. The line names the emoji, since that is
+    /// exactly what everyone is about to see next to the name, and carries the
+    /// rented window as a tag.
+    pub fn badge_rented(
+        user_id: Uuid,
+        username: impl Into<String>,
+        emoji: impl Into<String>,
+        duration_secs: i64,
+    ) -> Self {
+        use late_core::models::rental::duration_tag;
+        let emoji = emoji.into();
+        let action = format!("rented {emoji} ({})", duration_tag(duration_secs));
+        Self::new(
+            Some(user_id),
+            username,
+            ActivityKind::BadgeRented { emoji },
+            action,
+        )
+    }
+
+    /// A rented title went live. The line reads as the title does in chat:
+    /// "mira is now the insufferable (30d)".
+    pub fn title_applied(
+        user_id: Uuid,
+        username: impl Into<String>,
+        title: impl Into<String>,
+        duration_secs: i64,
+    ) -> Self {
+        use late_core::models::rental::duration_tag;
+        let title = title.into();
+        let action = format!("is now {title} ({})", duration_tag(duration_secs));
+        Self::new(
+            Some(user_id),
+            username,
+            ActivityKind::TitleApplied { title },
+            action,
+        )
+    }
+
+    /// A burn milestone was unlocked. The emoji rides the action so the line
+    /// shows exactly what is about to appear next to the name, and the price
+    /// is spelled out with separators because six digits run together
+    /// otherwise.
+    pub fn burn_milestone(
+        user_id: Uuid,
+        username: impl Into<String>,
+        name: impl Into<String>,
+        emoji: impl Into<String>,
+        price: i64,
+    ) -> Self {
+        let name = name.into();
+        let emoji = emoji.into();
+        let action = format!(
+            "burned {} chips for the {name} {emoji}",
+            crate::app::common::primitives::thousands(price)
+        );
+        Self::new(
+            Some(user_id),
+            username,
+            ActivityKind::BurnMilestone { name, price },
+            action,
+        )
+    }
+
+    /// A message crossed the gild threshold. Written from the author's side
+    /// ("mira got a message gilded 3 times in #lounge") because the feed line
+    /// is a compliment, not a receipt: nobody who paid is named, and the room
+    /// is, so people can go and read it.
+    pub fn message_gilded(
+        author_id: Uuid,
+        author: impl Into<String>,
+        message_id: Uuid,
+        count: i64,
+        room_slug: Option<String>,
+    ) -> Self {
+        let room = room_slug
+            .as_deref()
+            .map(|slug| format!(" in #{slug}"))
+            .unwrap_or_default();
+        let action = format!("got a message gilded {count} times{room}");
+        Self::new(
+            Some(author_id),
+            author,
+            ActivityKind::MessageGilded {
+                message_id,
+                count,
+                room_slug,
+            },
+            action,
+        )
+    }
+
+    /// A takeover. Unlike the gild line this one names the loser on purpose:
+    /// the crown is a single slot, so "stole it from mira" is the event, and
+    /// nothing about it is a private embarrassment. A vacant crown reads
+    /// "claimed the vacant crown for 500". This is the ticker line; the
+    /// full #lounge headline is `filter::lounge_headline`.
+    pub fn crown_taken(
+        taker_id: Uuid,
+        taker: impl Into<String>,
+        reign_id: Uuid,
+        price: i64,
+        next_price: i64,
+        from: Option<String>,
+    ) -> Self {
+        let price_text = crate::app::common::primitives::thousands(price);
+        let action = match &from {
+            Some(from) => format!("stole the crown from {from} for {price_text}"),
+            None => format!("claimed the vacant crown for {price_text}"),
+        };
+        Self::new(
+            Some(taker_id),
+            taker,
+            ActivityKind::CrownTaken {
+                reign_id,
+                price,
+                next_price,
+                from,
+            },
+            action,
+        )
+    }
+
+    /// Someone bought the house a round. The line quotes both numbers because
+    /// each says something different: how many people it reached, and what it
+    /// cost the one who bought it.
+    pub fn round_bought(
+        buyer_id: Uuid,
+        buyer: impl Into<String>,
+        round_id: Uuid,
+        patrons: i64,
+        total_chips: i64,
+    ) -> Self {
+        let action = format!(
+            "bought the house a round, {patrons} drinks for {} chips",
+            crate::app::common::primitives::thousands(total_chips)
+        );
+        Self::new(
+            Some(buyer_id),
+            buyer,
+            ActivityKind::RoundBought {
+                round_id,
+                patrons,
+                total_chips,
+            },
+            action,
+        )
+    }
+
+    /// The pot drew. The line quotes what the winner actually received (the
+    /// fifth that was burned is not theirs to be congratulated for) and the
+    /// odds behind it.
+    pub fn pot_drawn(
+        winner_id: Uuid,
+        winner: impl Into<String>,
+        pot_id: Uuid,
+        payout: i64,
+        winner_tickets: i64,
+        total_tickets: i64,
+    ) -> Self {
+        use crate::app::common::primitives::thousands;
+        let action = format!(
+            "won {} chips from the pot on {} of {} tickets",
+            thousands(payout),
+            thousands(winner_tickets),
+            thousands(total_tickets)
+        );
+        Self::new(
+            Some(winner_id),
+            winner,
+            ActivityKind::PotDrawn {
+                pot_id,
+                payout,
+                winner_tickets,
+                total_tickets,
+            },
+            action,
         )
     }
 

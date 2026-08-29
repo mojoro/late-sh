@@ -24,6 +24,7 @@ use vte::{Params, Parser, Perform};
 
 const PENDING_ESCAPE_FLUSH_DELAY: Duration = Duration::from_millis(40);
 const CTRL_G: u8 = 0x07;
+const CTRL_L: u8 = 0x0C;
 const CTRL_O: u8 = 0x0F;
 const CTRL_T: u8 = 0x14;
 const CTRL_V: u8 = 0x16;
@@ -908,6 +909,11 @@ fn handle_parsed_input_inner(app: &mut App, event: ParsedInput) {
 
     if app.show_poll_modal {
         chat::polls::input::handle_input(app, event);
+        return;
+    }
+
+    if app.show_gild_modal {
+        chat::gild::input::handle_input(app, event);
         return;
     }
 
@@ -2111,6 +2117,10 @@ fn dispatch_escape(app: &mut App) {
         chat::polls::input::handle_escape(app);
         return;
     }
+    if app.show_gild_modal {
+        chat::gild::input::close(app);
+        return;
+    }
     if app.chat.cyberspace.modal_active() {
         chat::cyberspace::input::handle_modal_escape(app);
         return;
@@ -2416,7 +2426,12 @@ fn trigger_image_upload(app: &mut App, data: Vec<u8>) {
     ));
 }
 
-pub(crate) fn trigger_url_image_upload(app: &mut App, url: String, room_id: Option<uuid::Uuid>) {
+pub(crate) fn trigger_url_image_upload(
+    app: &mut App,
+    url: String,
+    room_id: Option<uuid::Uuid>,
+    reply_target: Option<crate::app::chat::state::ReplyTarget>,
+) {
     use crate::app::files::image_upload::download_and_reupload_url;
     let Some(files) = app.chat.files_config().cloned() else {
         app.banner = Some(crate::app::common::primitives::Banner::error(
@@ -2426,7 +2441,7 @@ pub(crate) fn trigger_url_image_upload(app: &mut App, url: String, room_id: Opti
     };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if let Some(banner) = app.chat.begin_image_upload(room_id, rx) {
+    if let Some(banner) = app.chat.begin_image_upload(room_id, reply_target, rx) {
         app.banner = Some(banner);
         return;
     }
@@ -2813,6 +2828,10 @@ pub(crate) enum ChatClickKind {
     /// Click landed on the user's currently-equipped chat flag — opens
     /// the Hub Shop on the Flags sub-store. No double-click verb.
     StoreFlag,
+    /// Click landed on the user's burn milestone — opens the Hub Shop on
+    /// the Ultimates sub-store, where the ladder is sold. No double-click
+    /// verb.
+    StoreMilestone,
     /// Click landed on an inline image preview row — selects the message
     /// and opens the image viewer modal. No double-click verb.
     Image { message_id: Uuid },
@@ -2869,6 +2888,7 @@ fn chat_scroll_clicks_blocked(app: &App) -> bool {
         || app.show_profile_modal
         || app.show_sheet_modal
         || app.show_poll_modal
+        || app.show_gild_modal
         || app.chat.cyberspace.modal_active()
         || app.show_quit_confirm
         || app.show_bonsai_modal
@@ -2894,6 +2914,7 @@ fn classify_chat_hit(hit: &ChatRowHit, col: u16) -> Option<ChatClickKind> {
                 Some(HeaderTarget::Profile) => ChatClickKind::ProfileOf { message_id },
                 Some(HeaderTarget::StoreBadge) => ChatClickKind::StoreBadge,
                 Some(HeaderTarget::StoreFlag) => ChatClickKind::StoreFlag,
+                Some(HeaderTarget::StoreMilestone) => ChatClickKind::StoreMilestone,
                 None => ChatClickKind::BodySelect { message_id },
             },
         ),
@@ -2980,6 +3001,11 @@ fn handle_chat_scroll_click(app: &mut App, screen: Screen, x: u16, y: u16) -> bo
             app.show_hub_modal = true;
             app.shop_state
                 .select_category(crate::app::hub::shop::catalog::ShopCategory::Flags);
+        }
+        ChatClickKind::StoreMilestone => {
+            app.show_hub_modal = true;
+            app.shop_state
+                .select_category(crate::app::hub::shop::catalog::ShopCategory::Ultimates);
         }
         ChatClickKind::Image { message_id } => {
             app.chat.select_message_by_id_in_room(room_id, message_id);
@@ -3270,6 +3296,8 @@ fn open_room_search_modal_globally(app: &mut App) {
     app.show_sheet_modal = false;
     app.show_poll_modal = false;
     app.poll_modal_state.close();
+    app.show_gild_modal = false;
+    app.gild_modal_state.close();
     app.show_bonsai_modal = false;
     app.show_bonsai_v2_modal = false;
     app.show_lobby_modal = false;
@@ -3300,6 +3328,8 @@ fn open_settings_modal_globally(app: &mut App) {
     app.show_sheet_modal = false;
     app.show_poll_modal = false;
     app.poll_modal_state.close();
+    app.show_gild_modal = false;
+    app.gild_modal_state.close();
     app.show_bonsai_modal = false;
     app.show_bonsai_v2_modal = false;
     app.show_lobby_modal = false;
@@ -3327,6 +3357,8 @@ pub(crate) fn open_shop_modal_globally(app: &mut App) {
     app.show_sheet_modal = false;
     app.show_poll_modal = false;
     app.poll_modal_state.close();
+    app.show_gild_modal = false;
+    app.gild_modal_state.close();
     app.show_bonsai_modal = false;
     app.show_bonsai_v2_modal = false;
     app.show_lobby_modal = false;
@@ -3438,6 +3470,8 @@ fn open_bonsai_v2_modal_globally(app: &mut App) {
     app.show_sheet_modal = false;
     app.show_poll_modal = false;
     app.poll_modal_state.close();
+    app.show_gild_modal = false;
+    app.gild_modal_state.close();
     app.show_bonsai_modal = false;
     app.show_bonsai_v2_modal = false;
     app.show_lobby_modal = false;
@@ -3459,6 +3493,8 @@ pub(crate) fn open_daily_modal_globally(app: &mut App) {
     app.show_sheet_modal = false;
     app.show_poll_modal = false;
     app.poll_modal_state.close();
+    app.show_gild_modal = false;
+    app.gild_modal_state.close();
     app.show_bonsai_modal = false;
     app.show_bonsai_v2_modal = false;
     app.show_settings = false;
@@ -3539,6 +3575,13 @@ fn handle_reserved_global_chord(app: &mut App, event: &ParsedInput) -> bool {
     // raw control bytes as drawing commands.
     if app.screen == Screen::Artboard && app.artboard_interacting {
         return false;
+    }
+
+    // The scratchpad spends Ctrl+L on its language cycle and says so in its
+    // own footer, so it keeps the key; every other screen gets the redraw.
+    if *byte == CTRL_L && app.screen != Screen::Scratchpad {
+        app.force_full_repaint();
+        return true;
     }
 
     match *byte {
@@ -3779,6 +3822,8 @@ fn handle_global_key(app: &mut App, ctx: InputContext, byte: u8) -> bool {
                 app.show_sheet_modal = false;
                 app.show_poll_modal = false;
                 app.poll_modal_state.close();
+                app.show_gild_modal = false;
+                app.gild_modal_state.close();
                 app.show_settings = false;
                 app.show_hub_modal = false;
                 app.show_quit_confirm = false;

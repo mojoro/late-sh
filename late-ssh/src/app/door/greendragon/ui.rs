@@ -18,6 +18,10 @@ use super::data;
 use super::model::{self, Character, Specialty};
 use super::state::{BankOp, FoeKind, Mode, PvpVenue, State};
 
+/// Smallest inner area the village/forest pages still fit in.
+const MIN_WIDTH: u16 = 30;
+const MIN_HEIGHT: u16 = 10;
+
 /// Draw the live Green Dragon game (called when a character is loaded).
 pub fn draw_page(frame: &mut Frame, area: Rect, state: &State) {
     let block = Block::default()
@@ -32,10 +36,13 @@ pub fn draw_page(frame: &mut Frame, area: Rect, state: &State) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.width < 30 || inner.height < 10 {
-        frame.render_widget(
-            Paragraph::new("Terminal too small for Legend of the Green Dragon"),
+    if inner.width < MIN_WIDTH || inner.height < MIN_HEIGHT {
+        crate::app::common::primitives::draw_too_small(
+            frame,
             inner,
+            "Legend of the Green Dragon",
+            MIN_WIDTH,
+            MIN_HEIGHT,
         );
         return;
     }
@@ -1317,11 +1324,11 @@ pub fn draw_landing(frame: &mut Frame, area: Rect, delete_confirm: bool) {
     lines.push(landing::heading("Rewards"));
     lines.push(landing::stat(
         "Green Dragon slain",
-        "10,000 chips + GDS badge, once per account",
+        "10,000 chips, and the GDS badge the first time",
         20,
     ));
     lines.push(Line::from(Span::styled(
-        "  Slay again for titles and dragon points, but the chip payout is a lifetime claim.",
+        "  Every kill pays: the dragon sends you back to level 1, so the climb is the price.",
         Style::default().fg(theme::TEXT_FAINT()),
     )));
     lines.push(Line::raw(""));

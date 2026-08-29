@@ -197,6 +197,16 @@ pub async fn run_with_listener(
         // the real publickey auth is even attempted.
         auth_rejection_time_initial: Some(std::time::Duration::ZERO),
         keys,
+        // Offer `none` only. russh advertises zlib by default, and clients
+        // that ask for it (`ssh -C`, `Compression yes`) have been dropping
+        // mid-session with "closed by remote host" on the first keystroke
+        // that moves a character. A TUI frame stream is small and already
+        // poorly compressible, so there is nothing to win here and a live
+        // disconnect to lose.
+        preferred: russh::Preferred {
+            compression: std::borrow::Cow::Borrowed(&[russh::compression::NONE]),
+            ..russh::Preferred::DEFAULT
+        },
         window_size: 8 * 1024 * 1024, // 8MB window size
         event_buffer_size: 128,
         nodelay: true,
@@ -825,7 +835,7 @@ impl russh::server::Handler for ClientHandler {
             }
         };
         let key_fingerprint = self.auth_fingerprint.clone();
-        let key_layout = crate::session_bootstrap::load_device_rails(
+        let device = crate::session_bootstrap::load_device_state(
             &self.state,
             user_id,
             key_fingerprint.as_deref(),
@@ -866,6 +876,7 @@ impl russh::server::Handler for ClientHandler {
             stream_service: self.state.stream_service.clone(),
             chat_service,
             translation_service: self.state.translation_service.clone(),
+            summary_service: self.state.summary_service.clone(),
             notification_service: self.state.notification_service.clone(),
             article_service,
             feed_service: self.state.feed_service.clone(),
@@ -990,11 +1001,14 @@ impl russh::server::Handler for ClientHandler {
             ),
             show_aquarium_tray: late_core::models::user::extract_show_aquarium_tray(&user.settings),
             key_fingerprint,
-            key_layout,
+            key_layout: device.layout,
+            key_left_at: device.left_at,
             afk_users: self.state.afk_users.clone(),
             username_directory: Some(self.state.username_directory.clone()),
             flair_directory: Some(self.state.flair_directory.clone()),
             pomodoro_directory: Some(self.state.pomodoro_directory.clone()),
+            crown_service: Some(self.state.crown_service.clone()),
+            pot_service: Some(self.state.pot_service.clone()),
             activity_feed_rx: self.activity_feed_rx.take(),
             initial_announcements,
             user_id,
