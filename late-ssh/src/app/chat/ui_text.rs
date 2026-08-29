@@ -8,22 +8,30 @@ use crate::app::chat::state::TranslationDisplay;
 use crate::app::chat::svc::ReportKind;
 use crate::app::common::username_effect::{NameStyle, char_color};
 use crate::app::common::{markdown::render_body_to_lines, theme};
-use late_core::models::{article::NEWS_MARKER, chat_message_reaction::ChatMessageReactionSummary};
+use late_core::models::{
+    article::NEWS_MARKER,
+    chat_message_gild::{ChatMessageGildSummary, GildTier},
+    chat_message_reaction::ChatMessageReactionSummary,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NEWS_SEPARATOR: &str = " || ";
 
 /// The flair painted over the bare username inside the author header: the
-/// tavern drunk state as a trailing `(word)` label and/or a bought 24h
-/// username effect as per-character foreground color. `range` is the
+/// tavern drunk state as a trailing `(word)` label, a bought username effect
+/// as per-character foreground color, and a rented title. `range` is the
 /// username's byte range within the prefix string, so badges and flags stay
-/// untouched. `word` pairs the printed state with the dim hue that carries it
-/// (green tipsy through red wasted). The effect fg deliberately overrides the
-/// base author fg (own amber, friend gold, default) while keeping its
-/// modifiers, so a bought effect always wins the color of the name.
+/// untouched; `title_range` is the `, <title>` that follows it, painted in
+/// the dim label color because a title is text, not another name. `word`
+/// pairs the printed drunk state with the dim hue that carries it (green
+/// tipsy through red wasted). The effect fg deliberately overrides the base
+/// author fg (own amber, friend gold, default) while keeping its modifiers,
+/// so a bought effect always wins the color of the name.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AuthorTint {
     pub range: (usize, usize),
+    pub crown_range: Option<(usize, usize)>,
+    pub title_range: Option<(usize, usize)>,
     pub word: Option<(&'static str, Color)>,
     pub name_style: Option<NameStyle>,
 }
@@ -39,8 +47,9 @@ fn drunk_word_span(word: &str, color: Color) -> Span<'static> {
 }
 
 /// The author header's prefix spans: one span when untinted (byte-identical
-/// to the historical output), split when drunk tint and/or a username effect
-/// paints the name. Falls back to the single span on any out-of-bounds range.
+/// to the historical output), split when a drunk tint, a username effect, a
+/// crown, or a rented title paints part of it. Falls back to the single span
+/// on any out-of-bounds range.
 ///
 /// A username effect emits one span per character so gradients and shimmer
 /// interpolate across the name; the country-flag emoji inside the range
@@ -51,36 +60,106 @@ fn push_author_prefix_spans(
     author_style: Style,
     tint: Option<AuthorTint>,
 ) {
-    if let Some(tint) = tint {
-        let (start, end) = tint.range;
-        if start < end
-            && end <= prefix.len()
-            && prefix.is_char_boundary(start)
-            && prefix.is_char_boundary(end)
-        {
-            if start > 0 {
-                spans.push(Span::styled(prefix[..start].to_string(), author_style));
-            }
-            let name = &prefix[start..end];
-            match tint.name_style {
-                Some(style) => {
-                    let len = name.chars().count();
-                    spans.extend(name.chars().enumerate().map(|(index, ch)| {
-                        Span::styled(
-                            ch.to_string(),
-                            author_style.fg(char_color(style, index, len)),
-                        )
-                    }));
-                }
-                None => spans.push(Span::styled(name.to_string(), author_style)),
-            }
-            if end < prefix.len() {
-                spans.push(Span::styled(prefix[end..].to_string(), author_style));
-            }
-            return;
+    let Some(tint) = tint else {
+        spans.push(Span::styled(prefix.to_string(), author_style));
+        return;
+    };
+    let (start, end) = tint.range;
+    if start >= end
+        || end > prefix.len()
+        || !prefix.is_char_boundary(start)
+        || !prefix.is_char_boundary(end)
+    {
+        spans.push(Span::styled(prefix.to_string(), author_style));
+        return;
+    }
+
+    if start > 0 {
+        spans.push(Span::styled(prefix[..start].to_string(), author_style));
+    }
+    let name = &prefix[start..end];
+    match tint.name_style {
+        Some(style) => {
+            let len = name.chars().count();
+            spans.extend(name.chars().enumerate().map(|(index, ch)| {
+                Span::styled(
+                    ch.to_string(),
+                    author_style.fg(char_color(style, index, len)),
+                )
+            }));
+        }
+        None => spans.push(Span::styled(name.to_string(), author_style)),
+    }
+
+    // The crown and the rented title trail the name directly, in that order,
+    // each painted in its own color so neither takes the name's effect. A
+    // range that does not sit exactly where the builder put it is left to
+    // the tail rather than trusted.
+    let mut cursor = end;
+    for (range, style) in [
+        (tint.crown_range, Style::default().fg(theme::AMBER_GLOW())),
+        (tint.title_range, Style::default().fg(theme::TEXT_DIM())),
+    ] {
+        let Some((from, to)) = range else { continue };
+        if from != cursor || to <= from || to > prefix.len() || !prefix.is_char_boundary(to) {
+            continue;
+        }
+        spans.push(Span::styled(prefix[from..to].to_string(), style));
+        cursor = to;
+    }
+
+    if cursor < prefix.len() {
+        spans.push(Span::styled(prefix[cursor..].to_string(), author_style));
+    }
+}
+
+/// The one-cell gutter at the left of every line a message renders: the
+/// header, the body, inline images, the translation block, and the footer.
+/// A closed enum rather than two flags so the two claims on that cell are
+/// ranked in one place. A mention bar names something the reader has to act
+/// on; a gild bar is a permanent decoration whose tier the footer chip also
+/// spells. So a message that is both keeps the mention bar and loses nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Gutter {
+    Plain,
+    Mention,
+    Gild(GildTier),
+}
+
+impl Gutter {
+    pub(super) fn of(mentions_us: bool, gild: Option<ChatMessageGildSummary>) -> Self {
+        match (mentions_us, gild) {
+            (true, _) => Self::Mention,
+            (false, Some(gild)) => Self::Gild(gild.top_tier),
+            (false, None) => Self::Plain,
         }
     }
-    spans.push(Span::styled(prefix.to_string(), author_style));
+
+    const fn glyph(self) -> &'static str {
+        match self {
+            Self::Plain => " ",
+            Self::Mention => "│",
+            Self::Gild(_) => "┃",
+        }
+    }
+
+    fn span(self) -> Span<'static> {
+        let style = match self {
+            Self::Plain => Style::default(),
+            Self::Mention => Style::default().fg(theme::MENTION()),
+            Self::Gild(tier) => Style::default().fg(gild_color(tier)),
+        };
+        Span::styled(self.glyph(), style)
+    }
+
+    /// Whether a rendered row's first cell is a gutter this module drew, so
+    /// the selection marker may take it. Selection always paints on top of
+    /// any bar; the row's remaining spans still carry the bar's treatment.
+    pub(super) fn is_glyph(content: &str) -> bool {
+        content == Self::Plain.glyph()
+            || content == Self::Mention.glyph()
+            || content == Self::Gild(GildTier::Bronze).glyph()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -92,15 +171,11 @@ pub(super) fn wrap_message_to_lines(
     author_style: Style,
     author_tint: Option<AuthorTint>,
     body_style: Style,
-    mentions_us: bool,
+    gutter: Gutter,
     continuation: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let pad = if mentions_us {
-        Span::styled("│", Style::default().fg(theme::MENTION()))
-    } else {
-        Span::raw(" ")
-    };
+    let pad = gutter.span();
 
     if !continuation {
         let mut spans = vec![pad.clone()];
@@ -138,13 +213,11 @@ pub(super) fn wrap_chat_entry_to_lines(
     system_text: Option<&str>,
     inline_image_lines: Option<&[Line<'static>]>,
     reactions: &[ChatMessageReactionSummary],
+    gild: Option<ChatMessageGildSummary>,
     translation: Option<&TranslationDisplay>,
 ) -> WrappedChatEntry {
-    let pad = if mentions_us {
-        Span::styled("│", Style::default().fg(theme::MENTION()))
-    } else {
-        Span::raw(" ")
-    };
+    let gutter = Gutter::of(mentions_us, gild);
+    let pad = gutter.span();
     let news_payload = system_text
         .is_none()
         .then(|| parse_news_payload(body))
@@ -181,7 +254,7 @@ pub(super) fn wrap_chat_entry_to_lines(
     } else if let Some((kind, text)) = report_payload {
         wrap_report_to_lines(stamp, prefix, width, author_style, kind, text)
     } else if let Some(action) = action_payload {
-        wrap_action_to_lines(action, prefix, width, body_style, mentions_us)
+        wrap_action_to_lines(action, prefix, width, body_style, gutter)
     } else {
         wrap_message_to_lines(
             body,
@@ -191,7 +264,7 @@ pub(super) fn wrap_chat_entry_to_lines(
             author_style,
             author_tint,
             body_style,
-            mentions_us,
+            gutter,
             continuation,
         )
     };
@@ -212,7 +285,7 @@ pub(super) fn wrap_chat_entry_to_lines(
         lines.extend(translation_lines(translation, width, &pad));
     }
 
-    lines.extend(render_reaction_footer_lines(reactions, width, pad));
+    lines.extend(render_message_footer_lines(gild, reactions, width, pad));
     WrappedChatEntry {
         lines,
         header_line_index,
@@ -297,13 +370,9 @@ fn wrap_action_to_lines(
     prefix: &str,
     width: usize,
     body_style: Style,
-    mentions_us: bool,
+    gutter: Gutter,
 ) -> Vec<Line<'static>> {
-    let pad = if mentions_us {
-        Span::styled("│", Style::default().fg(theme::MENTION()))
-    } else {
-        Span::raw(" ")
-    };
+    let pad = gutter.span();
     let style = body_style.add_modifier(Modifier::ITALIC);
     render_body_to_lines(&format!("* {prefix} {action}"), width, pad, style)
 }
@@ -552,13 +621,53 @@ fn wrap_report_to_lines(
 
 // ── Reaction footer ─────────────────────────────────────────
 
-fn render_reaction_footer_lines(
+/// The gild marker's chip: the best tier's glyphs, and the total count once
+/// more than one person has paid. It leads the footer rather than riding the
+/// author header because a message in a run of messages has no header at
+/// all, and a paid marker that vanishes on the second message of a run would
+/// be the one thing nobody accepts about it. The tier-colored gutter
+/// ([`Gutter::Gild`]) runs the full height of the message for the same reason.
+pub(super) fn gild_chip_text(gild: ChatMessageGildSummary) -> String {
+    match gild.count {
+        1 => gild.top_tier.marker().to_string(),
+        count => format!("{} ×{count}", gild.top_tier.marker()),
+    }
+}
+
+fn gild_color(tier: GildTier) -> Color {
+    match tier {
+        GildTier::Bronze => theme::BADGE_BRONZE(),
+        GildTier::Silver => theme::BADGE_SILVER(),
+        GildTier::Gold => theme::BADGE_GOLD(),
+    }
+}
+
+/// The row under a message: its gild marker first, then its reactions,
+/// packed left to right and wrapped at the pane width.
+fn render_message_footer_lines(
+    gild: Option<ChatMessageGildSummary>,
     reactions: &[ChatMessageReactionSummary],
     width: usize,
     pad: Span<'static>,
 ) -> Vec<Line<'static>> {
-    if reactions.is_empty() {
+    if gild.is_none() && reactions.is_empty() {
         return Vec::new();
+    }
+
+    let mut chips: Vec<(String, Style)> = Vec::with_capacity(reactions.len() + 1);
+    if let Some(gild) = gild {
+        chips.push((
+            gild_chip_text(gild),
+            Style::default()
+                .fg(gild_color(gild.top_tier))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    for reaction in reactions {
+        chips.push((
+            format!("[{} {}]", reaction.icon, reaction.count),
+            Style::default().fg(theme::TEXT_DIM()),
+        ));
     }
 
     let mut footer_lines: Vec<Line<'static>> = Vec::new();
@@ -566,8 +675,7 @@ fn render_reaction_footer_lines(
     let mut current_width = 0usize;
     let mut current_spans = vec![pad.clone()];
 
-    for reaction in reactions {
-        let text = format!("[{} {}]", reaction.icon, reaction.count);
+    for (text, style) in chips {
         let chip_width = UnicodeWidthStr::width(text.as_str());
         let extra_space = usize::from(current_width > 0);
         if current_width > 0 && current_width + extra_space + chip_width > available_width {
@@ -579,7 +687,7 @@ fn render_reaction_footer_lines(
             current_spans.push(Span::raw(" "));
             current_width += 1;
         }
-        current_spans.push(Span::styled(text, Style::default().fg(theme::TEXT_DIM())));
+        current_spans.push(Span::styled(text, style));
         current_width += chip_width;
     }
 

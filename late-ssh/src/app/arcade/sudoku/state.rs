@@ -14,10 +14,13 @@ use late_core::models::sudoku::{Game, GameParams};
 pub type Grid = [[u8; 9]; 9];
 pub type Mask = [[bool; 9]; 9];
 /// Pencil marks: one bitmask per cell, bit `n-1` set means candidate `n` is
-/// noted. Player solving aid, kept alongside the board but not (yet) persisted
-/// to the DB, so notes survive mode/difficulty switches within a session but
-/// reset on reconnect.
+/// noted. Player solving aid, saved to the DB alongside the board, so notes
+/// survive mode/difficulty switches and reconnects alike.
 pub type Notes = [[u16; 9]; 9];
+
+/// The nine legal candidate bits. Anything above them is noise from a hand-
+/// edited or future-shaped row and is dropped on restore.
+const NOTE_MASK: u16 = 0x01ff;
 
 pub const DIFFICULTIES: [&str; 3] = ["easy", "medium", "hard"];
 
@@ -90,6 +93,9 @@ pub struct State {
     pub is_game_over: bool,
     pub reset_pending: Option<ResetKind>,
     daily_snapshots: HashMap<String, BoardSnapshot>,
+    /// The UTC date `daily_snapshots` was built for. A session that never
+    /// disconnects has to notice midnight itself; see `ensure_current_daily`.
+    daily_date: NaiveDate,
     personal_snapshots: HashMap<String, BoardSnapshot>,
     daily_generation_rx: Option<Receiver<DailyGenerationResult>>,
     pub svc: SudokuService,
@@ -141,12 +147,40 @@ impl State {
             is_game_over: false,
             reset_pending: None,
             daily_snapshots,
+            daily_date: today,
             personal_snapshots,
             daily_generation_rx: (pending_daily_generations > 0).then_some(daily_generation_rx),
             svc,
         };
         state.load_mode_snapshot_for_selected_difficulty();
         state
+    }
+
+    /// Roll the daily boards forward when the UTC date changes under a live
+    /// session; see `minesweeper::state::State::ensure_current_daily` for why
+    /// only a long-lived connection needs this. Generation is slow enough to
+    /// run off-thread, so the boards arrive through the same channel the
+    /// session's first load uses and the screen shows its loading state until
+    /// they do. Returns true when the boards moved.
+    pub fn ensure_current_daily(&mut self) -> bool {
+        let today = self.svc.today();
+        if self.daily_date == today {
+            return false;
+        }
+        self.daily_date = today;
+        self.daily_snapshots.clear();
+
+        let (tx, rx) = mpsc::channel();
+        for &dk in &DIFFICULTIES {
+            spawn_daily_generation(dk.to_string(), self.svc.clone(), tx.clone());
+        }
+        self.daily_generation_rx = Some(rx);
+
+        if self.mode == Mode::Daily {
+            self.reset_pending = None;
+            self.load_mode_snapshot_for_selected_difficulty();
+        }
+        true
     }
 
     pub fn ensure_loaded(&mut self) {
@@ -278,17 +312,25 @@ impl State {
     }
 
     fn save_async(&self) {
-        self.svc.save_game_task(GameParams {
+        self.svc.save_game_task(self.save_params());
+    }
+
+    fn save_params(&self) -> GameParams {
+        GameParams {
             user_id: self.user_id,
             mode: self.mode.as_str().to_string(),
             difficulty_key: self.difficulty_key().to_string(),
-            puzzle_date: puzzle_date_for_mode(self.mode, self.svc.today()),
+            // The loaded board's own date, not the wall clock: past UTC
+            // midnight the two disagree until the rollover lands, and a stale
+            // board must save as its own (then ignored) day.
+            puzzle_date: puzzle_date_for_mode(self.mode, self.daily_date),
             puzzle_seed: self.seed as i64,
             grid: serde_json::to_value(self.grid).unwrap_or_default(),
             fixed_mask: serde_json::to_value(self.fixed_mask).unwrap_or_default(),
+            notes: serde_json::to_value(self.notes).unwrap_or_default(),
             is_game_over: self.is_game_over,
             score: 0,
-        });
+        }
     }
 
     // --- Interaction ---
@@ -331,6 +373,7 @@ impl State {
         }
         self.notes[r][c] ^= 1 << (val - 1);
         self.store_active_snapshot();
+        self.save_async();
     }
 
     /// Wipe every pencil mark from the cursor cell.
@@ -343,6 +386,7 @@ impl State {
         if self.notes[r][c] != 0 {
             self.notes[r][c] = 0;
             self.store_active_snapshot();
+            self.save_async();
         }
     }
 
@@ -411,8 +455,12 @@ impl State {
             self.is_game_over = true;
             self.store_active_snapshot();
             if self.mode == Mode::Daily {
-                self.svc
-                    .record_win_task(self.user_id, self.difficulty_key().to_string(), 1);
+                self.svc.record_win_task(
+                    self.user_id,
+                    self.difficulty_key().to_string(),
+                    self.daily_date,
+                    1,
+                );
             }
         }
     }
@@ -651,13 +699,52 @@ fn snapshot_from_game(game: &Game) -> BoardSnapshot {
         }
     }
 
+    let mut notes = notes_from_value(&game.notes);
+    for r in 0..9 {
+        for c in 0..9 {
+            // A given clue or a filled cell has nothing left to guess at, and
+            // the live board enforces that in `toggle_note`/`set_digit`. Hold
+            // the same line on restore so a stale row cannot smuggle marks
+            // into a settled cell.
+            if fixed_mask[r][c] || grid[r][c] != 0 {
+                notes[r][c] = 0;
+            }
+        }
+    }
+
     BoardSnapshot {
         seed: game.puzzle_seed as u64,
         grid,
         fixed_mask,
-        notes: [[0; 9]; 9],
+        notes,
         is_game_over: game.is_game_over,
     }
+}
+
+/// Pencil marks out of a persisted board. Only an exact 9x9 matrix of
+/// non-negative numbers is accepted; anything else restores as "no notes"
+/// rather than as a half-understood mark set, since a bad row must never take
+/// a session's bootstrap down with it.
+fn notes_from_value(value: &serde_json::Value) -> Notes {
+    let mut notes: Notes = [[0; 9]; 9];
+
+    let Some(rows) = value.as_array().filter(|rows| rows.len() == 9) else {
+        return notes;
+    };
+
+    for (r, row_val) in rows.iter().enumerate() {
+        let Some(cells) = row_val.as_array().filter(|cells| cells.len() == 9) else {
+            return [[0; 9]; 9];
+        };
+        for (c, cell) in cells.iter().enumerate() {
+            let Some(bits) = cell.as_u64() else {
+                return [[0; 9]; 9];
+            };
+            notes[r][c] = (bits & NOTE_MASK as u64) as u16;
+        }
+    }
+
+    notes
 }
 
 fn board_has_player_marks(grid: &Grid, fixed_mask: &Mask, notes: &Notes) -> bool {

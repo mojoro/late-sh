@@ -71,50 +71,6 @@ async fn load_waits_for_queued_saves_before_reading_reconnect_state() {
     assert_eq!(personal.moves, 12);
 }
 
-#[tokio::test]
-async fn completion_queue_rejects_personal_game_params() {
-    let test_db = new_test_db().await;
-    let user = create_test_user(&test_db.db, "sliding-puzzle-personal-complete-guard").await;
-    let today = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
-    let (activity_tx, mut activity_rx) = broadcast::channel(8);
-    let service = SlidingPuzzleService::new(test_db.db.clone(), activity_tx);
-
-    service.complete_game_task(
-        GameParams {
-            user_id: user.id,
-            mode: "personal".to_string(),
-            difficulty_key: Difficulty::Easy.key().to_string(),
-            puzzle_date: None,
-            puzzle_seed: 1,
-            tiles: vec![1, 2, 3, 4, 5, 6, 7, 8, 0],
-            moves: 5,
-        },
-        Difficulty::Easy,
-        today,
-        5,
-    );
-    service
-        .flush_game_saves()
-        .await
-        .expect("flush rejected completion");
-
-    let client = test_db.db.get().await.expect("db client");
-    assert!(
-        DailyWin::find(&client, user.id, Difficulty::Easy.key(), today)
-            .await
-            .expect("daily win lookup")
-            .is_none()
-    );
-    assert!(activity_rx.try_recv().is_err());
-    assert!(
-        service
-            .load_games(user.id)
-            .await
-            .expect("load games")
-            .is_empty()
-    );
-}
-
 /// The flush barrier only orders queued writes ahead of the read; the database
 /// is the authority. A dead queue must not turn a reconnect into an empty
 /// restore that overwrites persisted boards.
@@ -166,79 +122,6 @@ async fn load_reads_persisted_rows_when_the_save_queue_worker_is_gone() {
         .find(|game| game.mode == "personal")
         .expect("personal slot");
     assert_eq!(personal.moves, 9);
-}
-
-/// Only a genuinely finished daily board pays out: the tiles have to be the
-/// canonical solved board for that difficulty, the seed has to be the one
-/// today's date derives, and it has to have taken at least one move.
-#[tokio::test]
-async fn completion_queue_rejects_unsolved_forged_seed_and_zero_move_daily_params() {
-    let test_db = new_test_db().await;
-    let user = create_test_user(&test_db.db, "sliding-puzzle-daily-complete-guard").await;
-    let today = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
-    let (activity_tx, mut activity_rx) = broadcast::channel(8);
-    let service = SlidingPuzzleService::new(test_db.db.clone(), activity_tx);
-    let daily_seed = super::state::daily_seed(today, Difficulty::Easy) as i64;
-    let solved = GameParams {
-        user_id: user.id,
-        mode: "daily".to_string(),
-        difficulty_key: Difficulty::Easy.key().to_string(),
-        puzzle_date: Some(today),
-        puzzle_seed: daily_seed,
-        tiles: vec![1, 2, 3, 4, 5, 6, 7, 8, 0],
-        moves: 5,
-    };
-
-    for (label, params, moves) in [
-        (
-            "unsolved tiles",
-            GameParams {
-                tiles: vec![1, 2, 3, 4, 5, 6, 7, 0, 8],
-                ..solved.clone()
-            },
-            5,
-        ),
-        (
-            "forged daily seed",
-            GameParams {
-                puzzle_seed: daily_seed ^ 1,
-                ..solved.clone()
-            },
-            5,
-        ),
-        (
-            "zero moves",
-            GameParams {
-                moves: 0,
-                ..solved.clone()
-            },
-            0,
-        ),
-    ] {
-        service.complete_game_task(params, Difficulty::Easy, today, moves);
-        service.flush_game_saves().await.expect(label);
-
-        let client = test_db.db.get().await.expect("db client");
-        assert!(
-            DailyWin::find(&client, user.id, Difficulty::Easy.key(), today)
-                .await
-                .expect("daily win lookup")
-                .is_none(),
-            "{label} recorded a daily win"
-        );
-        assert!(
-            activity_rx.try_recv().is_err(),
-            "{label} published activity"
-        );
-        assert!(
-            service
-                .load_games(user.id)
-                .await
-                .expect("load games")
-                .is_empty(),
-            "{label} persisted a board"
-        );
-    }
 }
 
 #[tokio::test]

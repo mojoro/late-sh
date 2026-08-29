@@ -166,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
     let ai_service = AiService::new(config.ai.enabled, config.ai.api_key.clone());
     let translation_service =
         late_ssh::app::ai::translate::TranslationService::new(db.clone(), ai_service.clone());
+    let summary_service =
+        late_ssh::app::ai::summary::SummaryService::new(db.clone(), ai_service.clone());
     let chat_service = ChatService::new_with_active_users(
         db.clone(),
         notification_service.clone(),
@@ -294,7 +296,24 @@ async fn main() -> anyhow::Result<()> {
                 .with_voice(voice_service.clone())
                 .with_stream(stream_service.clone()),
         )
-        .with_chip_service(chip_service.clone());
+        .with_chip_service(chip_service.clone())
+        .with_activity(activity_publisher.clone());
+    // Gild markers cross replicas over Postgres, not over this process's
+    // chat broadcast; see `ChatService::start_gild_listener_task`.
+    let _chat_gild_listener_task = chat_service.start_gild_listener_task(config.db.clone());
+    // The crown's glyph crosses replicas over Postgres, not over any
+    // in-process broadcast; the listener also seeds this replica's holder on
+    // every (re)connect. See `app/crown/svc.rs`.
+    let crown_service = late_ssh::app::crown::svc::CrownService::new(db.clone())
+        .with_activity(activity_publisher.clone());
+    let _crown_listener_task = crown_service.start_listener_task(config.db.clone());
+    // The pot's panel and its winner banner cross replicas over Postgres,
+    // and the draw is settled by a status transition so exactly one replica
+    // pays however many are sweeping. See `app/pot/svc.rs`.
+    let pot_service = late_ssh::app::pot::svc::PotService::new(db.clone())
+        .with_activity(activity_publisher.clone());
+    let _pot_listener_task = pot_service.start_listener_task(config.db.clone());
+    let _pot_sweeper_task = pot_service.start_sweeper_task();
     let leaderboard_service = late_ssh::app::LeaderboardService::new(db.clone());
     let _profile_award_snapshot_task = leaderboard_service
         .clone()
@@ -305,7 +324,8 @@ async fn main() -> anyhow::Result<()> {
     let flair_directory = late_ssh::app::common::username_effect::new_directory();
     let shop_service = late_ssh::app::ShopService::new(db.clone())
         .with_flair_directory(flair_directory.clone())
-        .with_activity(activity_publisher.clone());
+        .with_activity(activity_publisher.clone())
+        .with_ai_service(ai_service.clone());
     let _shop_listener_task = shop_service.start_listener_task(config.db.clone());
     let ultimate_service = late_ssh::app::UltimateService::new(db.clone());
     let nonogram_library = match late_ssh::app::arcade::nonogram::state::load_default_library() {
@@ -343,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
         db: db.clone(),
         ai_service: ai_service.clone(),
         translation_service: translation_service.clone(),
+        summary_service: summary_service.clone(),
         audio_service: audio_service.clone(),
         voice_service,
         stream_service,
@@ -393,6 +414,8 @@ async fn main() -> anyhow::Result<()> {
         username_directory: username_directory.clone(),
         flair_directory: flair_directory.clone(),
         pomodoro_directory: late_ssh::app::common::pomodoro::new_directory(),
+        crown_service: crown_service.clone(),
+        pot_service: pot_service.clone(),
         activity_feed: activity_tx,
         now_playing_rx: now_playing_rx.clone(),
         radio_meta_rx: radio_meta_rx.clone(),

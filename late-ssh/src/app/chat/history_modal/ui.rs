@@ -80,6 +80,7 @@ fn draw_messages(frame: &mut Frame, area: Rect, state: &ChatHistoryModalState) {
     let body_width = width.saturating_sub(TIME_WIDTH).max(1);
 
     let start = resolve_viewport(state, height, body_width);
+    let divider_before = state.unread_divider_target();
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
     let mut last_date: Option<chrono::NaiveDate> = None;
     let mut fully_shown = 0usize;
@@ -97,6 +98,16 @@ fn draw_messages(frame: &mut Frame, area: Rect, state: &ChatHistoryModalState) {
                 format!("── {date} "),
                 Style::default().fg(theme::BORDER_DIM()),
             )));
+            if lines.len() >= height {
+                break;
+            }
+        }
+        // The unread divider hugs the first message past the viewer's read
+        // cursor, the same rule the live tail draws. Like the day separators
+        // it is left out of the viewport budgets: one row off-center is
+        // invisible.
+        if divider_before == Some(message.id) {
+            lines.push(crate::app::chat::ui::new_messages_divider_line(width));
             if lines.len() >= height {
                 break;
             }

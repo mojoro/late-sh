@@ -1,5 +1,6 @@
 use asterion_core::MAX_MAZE_ID;
 
+use crate::app::common::primitives::thousands;
 use crate::app::lobby::house::{
     ssnake::settings::{
         SSNAKE_BONUS_FOOD_MULTIPLIER, SSNAKE_CLEAR_CHIPS, SSNAKE_CRASH_CHIPS,
@@ -10,6 +11,8 @@ use crate::app::lobby::house::{
 };
 use late_core::models::{
     asterion::ASTERION_DAILY_ESCAPE_PAYOUT,
+    chat_message_gild::GildTier,
+    drink_round::{ROUND_CREDIT_TTL_HOURS, ROUND_PRICE_PER_PATRON},
     drinks::{DRINK_PRICE_MAX, DRINK_PRICE_MIN, DRUNK_DECAY_PER_HOUR},
     quest::{DAILY_QUEST_STREAK_BONUS_CHIPS_PER_LEVEL, MAX_DAILY_QUEST_STREAK_BONUS_LEVEL},
 };
@@ -54,12 +57,27 @@ fn chip_sections() -> Vec<GuideSection> {
             ],
         },
         GuideSection {
+            title: "Gilds",
+            body: vec![
+                "Press g on someone else's message in a public room to gild it.".to_string(),
+                format!(
+                    "Three tiers: Bronze {}, Silver {}, Gold {} chips.",
+                    thousands(GildTier::Bronze.price()),
+                    thousands(GildTier::Silver.price()),
+                    thousands(GildTier::Gold.price())
+                ),
+                "Two thirds reaches the author; the last third is destroyed.".to_string(),
+                "The marker is permanent, and the count shows on the author's profile.".to_string(),
+                "No self-gilds, no gilding bots, and no un-gilding.".to_string(),
+            ],
+        },
+        GuideSection {
             title: "Top Chips",
             body: vec![
                 "Monthly Top Chips counts net chip delta.".to_string(),
                 "Betting losses offset betting wins; Shop spending does not lower your rank."
                     .to_string(),
-                "Floor restores are excluded from the board.".to_string(),
+                "Floor restores and gilds you receive are excluded from the board.".to_string(),
             ],
         },
     ]
@@ -78,6 +96,19 @@ fn bar_sections() -> Vec<GuideSection> {
                 "Your first ever drink is on the house.".to_string(),
                 "He only pours for you; use /gift @user <n> to send someone else chips."
                     .to_string(),
+            ],
+        },
+        GuideSection {
+            title: "The Round",
+            body: vec![
+                "Tell @bartender \"round for everyone\" and you buy the house one.".to_string(),
+                format!("{ROUND_PRICE_PER_PATRON} chips a head, for everyone online but you."),
+                "Say it plainly; he only rings up those exact words, never a question.".to_string(),
+                "You drink yours on the spot. Each of them gets a drink waiting".to_string(),
+                format!(
+                    "at the bar, good for {ROUND_CREDIT_TTL_HOURS}h, claimed by ordering from him."
+                ),
+                "One waiting drink each: a second round buys nobody a spare.".to_string(),
             ],
         },
         GuideSection {

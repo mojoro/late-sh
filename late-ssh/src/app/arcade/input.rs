@@ -97,7 +97,6 @@ pub fn handle_key(app: &mut App, byte: u8) -> bool {
                 app.is_playing_game = false;
                 return true;
             }
-            app.sliding_puzzle_state.ensure_current_daily();
             return super::sliding_puzzle::input::handle_key(&mut app.sliding_puzzle_state, byte);
         } else if app.game_selection == GAME_SELECTION_LE_WORD {
             if byte == b'?' {
@@ -200,7 +199,6 @@ pub fn handle_arrow(app: &mut App, key: u8) -> bool {
             app.rubiks_cube_state.ensure_current_daily();
             return super::rubiks_cube::input::handle_arrow(&mut app.rubiks_cube_state, key);
         } else if app.game_selection == GAME_SELECTION_SLIDING_PUZZLE {
-            app.sliding_puzzle_state.ensure_current_daily();
             return super::sliding_puzzle::input::handle_arrow(&mut app.sliding_puzzle_state, key);
         } else if app.game_selection == GAME_SELECTION_LE_WORD {
             return super::le_word::input::handle_arrow(&mut app.le_word_state, key);
@@ -239,7 +237,6 @@ pub(crate) fn handle_event(app: &mut App, event: &crate::app::input::ParsedInput
 
     let area = arcade_content_area(app);
     if app.game_selection == GAME_SELECTION_SLIDING_PUZZLE {
-        app.sliding_puzzle_state.ensure_current_daily();
         return super::sliding_puzzle::input::handle_mouse(
             &mut app.sliding_puzzle_state,
             area,

@@ -108,7 +108,7 @@ impl DailyPuzzle {
     }
 
     /// The per-user daily-win fact table.
-    const fn wins_table(self) -> &'static str {
+    pub(crate) const fn wins_table(self) -> &'static str {
         match self {
             Self::Sudoku => "sudoku_daily_wins",
             Self::Nonogram => "nonogram_daily_wins",
@@ -123,7 +123,7 @@ impl DailyPuzzle {
     /// SQL expression producing this puzzle's Arcade Wins points for one win
     /// row. Every weight comes from [`Difficulty::points`]; a difficulty key
     /// outside the puzzle's real set scores 0, never a silent default.
-    fn points_sql(self) -> String {
+    pub(crate) fn points_sql(self) -> String {
         match self {
             Self::Sudoku | Self::Nonogram | Self::Minesweeper | Self::SlidingPuzzle => {
                 let whens: String = Difficulty::ALL

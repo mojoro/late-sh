@@ -96,6 +96,7 @@ fn test_sudoku_games(user_id: Uuid) -> Vec<late_core::models::sudoku::Game> {
             puzzle_seed: idx as i64,
             grid: serde_json::to_value(grid).expect("sudoku grid json"),
             fixed_mask: serde_json::to_value(fixed_mask).expect("sudoku fixed mask json"),
+            notes: serde_json::to_value([[0u16; 9]; 9]).expect("sudoku notes json"),
             is_game_over: false,
             score: 0,
         }
@@ -234,6 +235,8 @@ pub fn test_app_state(db: Db, config: Config) -> State {
     let ai_service = AiService::new(false, None);
     let translation_service =
         crate::app::ai::translate::TranslationService::new(db.clone(), ai_service.clone());
+    let summary_service =
+        crate::app::ai::summary::SummaryService::new(db.clone(), ai_service.clone());
     let article_service = ArticleService::new(db.clone(), ai_service.clone(), chat_service.clone());
     let feed_service = crate::app::chat::feeds::svc::FeedService::new(db.clone());
     let showcase_service = crate::app::chat::showcase::svc::ShowcaseService::new(db.clone());
@@ -295,6 +298,8 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         username_directory,
         flair_directory: crate::app::common::username_effect::new_directory(),
         pomodoro_directory: crate::app::common::pomodoro::new_directory(),
+        crown_service: crate::app::crown::svc::CrownService::new(db.clone()),
+        pot_service: crate::app::pot::svc::PotService::new(db.clone()),
         config,
         db: db.clone(),
         audio_service: crate::app::audio::svc::AudioService::new(
@@ -309,6 +314,7 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         notification_service,
         ai_service,
         translation_service,
+        summary_service,
         article_service,
         feed_service,
         cyberspace_service: crate::app::chat::cyberspace::svc::CyberspaceService::new(
@@ -471,6 +477,10 @@ fn make_app_with_chat_service_and_permissions(
             db.clone(),
             AiService::new(false, None),
         ),
+        summary_service: crate::app::ai::summary::SummaryService::new(
+            db.clone(),
+            AiService::new(false, None),
+        ),
         notification_service: notification_service.clone(),
         article_service: ArticleService::new(
             db.clone(),
@@ -624,10 +634,13 @@ fn make_app_with_chat_service_and_permissions(
         // per-device layout, which is also what ghost bot sessions do.
         key_fingerprint: None,
         key_layout: None,
+        key_left_at: None,
         afk_users: crate::state::new_afk_users(),
         username_directory: None,
         flair_directory: None,
         pomodoro_directory: None,
+        crown_service: None,
+        pot_service: None,
         activity_feed_rx: None,
         initial_announcements: None,
         is_new_user: false,
@@ -684,6 +697,10 @@ pub fn make_app_with_paired_client(
         stream_service: test_stream_service(db.clone(), activity_tx.clone()),
         chat_service: ChatService::new(db.clone(), notification_service.clone()),
         translation_service: crate::app::ai::translate::TranslationService::new(
+            db.clone(),
+            AiService::new(false, None),
+        ),
+        summary_service: crate::app::ai::summary::SummaryService::new(
             db.clone(),
             AiService::new(false, None),
         ),
@@ -840,10 +857,13 @@ pub fn make_app_with_paired_client(
         // per-device layout, which is also what ghost bot sessions do.
         key_fingerprint: None,
         key_layout: None,
+        key_left_at: None,
         afk_users: crate::state::new_afk_users(),
         username_directory: None,
         flair_directory: None,
         pomodoro_directory: None,
+        crown_service: None,
+        pot_service: None,
         activity_feed_rx: None,
         initial_announcements: None,
         is_new_user: false,
@@ -922,6 +942,26 @@ pub async fn wait_for_render_contains(app: &mut App, needle: &str) {
         sleep(Duration::from_millis(30)).await;
     }
     panic!("timed out waiting for render to contain {needle:?}; last render:\n{last_plain}");
+}
+
+/// Tick and render until `needle` disappears from the frame; panics at the
+/// timeout if it is still there. The absence counterpart of
+/// [`wait_for_render_contains`], for state that clears asynchronously.
+pub async fn wait_for_render_not_contains(app: &mut App, needle: &str) {
+    let deadline = Instant::now() + ASYNC_TEST_TIMEOUT;
+    let mut last_plain = String::new();
+    while Instant::now() < deadline {
+        app.tick();
+        app.reset_render();
+        let frame = app.render().expect("render");
+        let plain = strip_ansi(&String::from_utf8_lossy(&frame));
+        if !plain.contains(needle) {
+            return;
+        }
+        last_plain = plain;
+        sleep(Duration::from_millis(30)).await;
+    }
+    panic!("timed out waiting for render to drop {needle:?}; last render:\n{last_plain}");
 }
 
 pub async fn assert_render_not_contains_for(app: &mut App, needle: &str, duration: Duration) {

@@ -278,6 +278,34 @@ fn personal_reset_restores_the_saved_scramble_from_its_seed() {
     assert_eq!(state.moves(), 0);
 }
 
+/// The day's win is banked the moment the board solves, so a reset would only
+/// put a finished puzzle back on the table (and write the scramble over the
+/// solved row). Personal boards keep their reset: nothing is banked there.
+#[test]
+fn daily_reset_is_refused_once_the_board_is_solved() {
+    let user_id = Uuid::now_v7();
+    let date = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+    let mut state = State::new_for_date(user_id, service(), date, Vec::new());
+    state.open_daily(0);
+    state.set_board_for_test(Difficulty::Easy, vec![1, 2, 3, 4, 5, 6, 7, 0, 8], 4);
+    assert!(state.move_blank(Direction::Right));
+    assert!(state.is_solved());
+    let solved = state.board().to_vec();
+
+    assert!(!state.request_reset());
+    assert!(!state.request_reset());
+    assert!(!state.reset_pending());
+    assert_eq!(state.board(), solved);
+    assert_eq!(state.moves(), 5);
+
+    state.show_personal();
+    state.set_board_for_test(Difficulty::Easy, vec![1, 2, 3, 4, 5, 6, 7, 0, 8], 4);
+    assert!(state.move_blank(Direction::Right));
+    assert!(state.is_solved());
+    assert!(!state.request_reset());
+    assert!(state.request_reset());
+}
+
 #[test]
 fn utc_rollover_regenerates_the_daily_slot_and_leaves_personal_progress_alone() {
     let user_id = Uuid::now_v7();
@@ -302,7 +330,7 @@ fn utc_rollover_regenerates_the_daily_slot_and_leaves_personal_progress_alone() 
     state.show_personal();
     assert_eq!(state.moves(), 7);
 
-    state.ensure_current_daily();
+    assert!(state.ensure_current_daily());
 
     let today = Utc::now().date_naive();
     let today_seed = super::state::daily_seed(today, Difficulty::Easy);

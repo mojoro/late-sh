@@ -1,4 +1,5 @@
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
@@ -13,8 +14,12 @@ use late_core::{
 use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
-use super::state::{daily_seed, solved_board};
 use crate::app::activity::event::{ActivityEvent, ActivityGame};
+
+/// How long a session load waits for the shared save queue to drain before
+/// reading the database anyway. The queue is process-wide, so without a bound
+/// one player's login would sit behind every other player's queued moves.
+pub(crate) const LOAD_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct SlidingPuzzleService {
@@ -49,14 +54,23 @@ impl SlidingPuzzleService {
 
     pub async fn load_games(&self, user_id: Uuid) -> Result<Vec<Game>> {
         // The barrier only orders queued writes ahead of this read. If it
-        // cannot answer, the database is still authoritative — returning an
-        // error here would hand bootstrap an empty restore that overwrites
-        // every persisted board on the next save.
-        if let Err(error) = self.flush_game_saves().await {
-            tracing::error!(
-                error = ?error,
-                "Sliding Puzzle save queue flush failed; restoring from the database anyway"
-            );
+        // cannot answer in time, the database is still authoritative:
+        // returning an error here would hand bootstrap an empty restore that
+        // overwrites every persisted board on the next save.
+        match tokio::time::timeout(LOAD_FLUSH_TIMEOUT, self.flush_game_saves()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(
+                    error = ?error,
+                    "Sliding Puzzle save queue flush failed; restoring from the database anyway"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::error!(
+                    timeout_secs = LOAD_FLUSH_TIMEOUT.as_secs(),
+                    "Sliding Puzzle save queue flush timed out; restoring from the database anyway"
+                );
+            }
         }
         let client = self.db.get().await?;
         Game::list_by_user_id(&client, user_id).await
@@ -72,6 +86,10 @@ impl SlidingPuzzleService {
         }
     }
 
+    /// Record a solved daily and persist the solved board behind it. The
+    /// state only calls this from the finishing move of a daily board, so the
+    /// params are trusted; the table's own gates (`moves > 0`, one win per
+    /// user/date/difficulty) are the checks that remain.
     pub fn complete_game_task(
         &self,
         params: GameParams,
@@ -79,34 +97,6 @@ impl SlidingPuzzleService {
         puzzle_date: NaiveDate,
         moves: i32,
     ) {
-        let canonical_seed = daily_seed(puzzle_date, difficulty) as i64;
-        let canonical_tiles: Vec<i32> = solved_board(difficulty)
-            .into_iter()
-            .map(i32::from)
-            .collect();
-        if params.mode != "daily"
-            || params.puzzle_date != Some(puzzle_date)
-            || params.difficulty_key != difficulty.key()
-            || params.moves != moves
-            || moves <= 0
-            || params.puzzle_seed != canonical_seed
-            || params.tiles != canonical_tiles
-        {
-            tracing::error!(
-                mode = %params.mode,
-                params_date = ?params.puzzle_date,
-                completion_date = %puzzle_date,
-                params_difficulty = %params.difficulty_key,
-                completion_difficulty = difficulty.key(),
-                params_moves = params.moves,
-                completion_moves = moves,
-                params_seed = params.puzzle_seed,
-                canonical_seed,
-                solved = params.tiles == canonical_tiles,
-                "rejected inconsistent Sliding Puzzle completion"
-            );
-            return;
-        }
         if self
             .game_save_sender()
             .send(GameSaveCommand::Complete {

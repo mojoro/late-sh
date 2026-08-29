@@ -41,6 +41,49 @@ fn click_global_offset_splits_into_line_and_col() {
     assert_eq!(global_char_to_line_col(text, 5), (1, 2));
 }
 
+/// The pot's composer boundary. Everything downstream trusts the count, so
+/// this is where an unbuyable number has to die: only 1..=cap gets through,
+/// and anything else is a usage banner rather than a refused transaction.
+#[test]
+fn parse_pot_command_only_admits_a_buyable_count() {
+    use late_core::models::pot::POT_MAX_TICKETS_PER_DAY;
+
+    assert_eq!(parse_pot_command("/pot"), Some(Some(PotCommand::Status)));
+    assert_eq!(
+        parse_pot_command("  /pot  "),
+        Some(Some(PotCommand::Status))
+    );
+    assert_eq!(
+        parse_pot_command("/pot buy 5"),
+        Some(Some(PotCommand::Buy { count: 5 }))
+    );
+    assert_eq!(
+        parse_pot_command(&format!("/pot buy {POT_MAX_TICKETS_PER_DAY}")),
+        Some(Some(PotCommand::Buy {
+            count: POT_MAX_TICKETS_PER_DAY
+        }))
+    );
+
+    // Usage banner: a count nobody could buy, and a subcommand that is not
+    // one. `Some(None)` is the "you meant the pot, but not like that" shape.
+    for junk in [
+        "/pot buy 0",
+        "/pot buy -3",
+        &format!("/pot buy {}", POT_MAX_TICKETS_PER_DAY + 1),
+        "/pot buy all",
+        "/pot buy",
+        "/pot sell 3",
+    ] {
+        assert_eq!(parse_pot_command(junk), Some(None), "{junk}");
+    }
+
+    // Not a pot command at all: a longer command that merely starts the same
+    // way must fall through to its own parser.
+    assert_eq!(parse_pot_command("/potato"), None);
+    assert_eq!(parse_pot_command("/pomodoro 25"), None);
+    assert_eq!(parse_pot_command("hello"), None);
+}
+
 #[test]
 fn parse_gift_command_accepts_at_optional_username() {
     assert_eq!(
@@ -2232,6 +2275,7 @@ fn chat_state_with_cyberspace(
     let chat = crate::app::chat::svc::ChatService::new(db.clone(), notifications.clone());
     let ai = crate::app::ai::svc::AiService::new(false, None);
     let translation = crate::app::ai::translate::TranslationService::new(db.clone(), ai.clone());
+    let summary = crate::app::ai::summary::SummaryService::new(db.clone(), ai.clone());
     let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai, chat.clone());
     let (notifier, _outbox) = crate::app::notify::channel();
     // Dead base URL: state logic under test never talks to the network.
@@ -2243,6 +2287,7 @@ fn chat_state_with_cyberspace(
         ChatServices {
             chat,
             translation,
+            summary,
             notifications,
             articles,
             feeds: crate::app::chat::feeds::svc::FeedService::new(db.clone()),
@@ -2250,8 +2295,12 @@ fn chat_state_with_cyberspace(
             work: crate::app::chat::work::svc::WorkService::new(db),
             cyberspace: cyberspace.clone(),
         },
-        user_id,
-        crate::authz::Permissions::new(false, false),
+        ChatSession {
+            user_id,
+            username: "internal-test-user".to_string(),
+            permissions: crate::authz::Permissions::new(false, false),
+            device_left_at: None,
+        },
         None,
         notifier,
         crate::app::ai::ladder::MentionLadders::new(),
@@ -3035,6 +3084,7 @@ async fn auto_mode_requests_fire_without_a_pending_placeholder() {
     let chat = crate::app::chat::svc::ChatService::new(db.clone(), notifications.clone());
     let ai = crate::app::ai::svc::AiService::new(false, None);
     let translation = crate::app::ai::translate::TranslationService::new(db.clone(), ai.clone());
+    let summary = crate::app::ai::summary::SummaryService::new(db.clone(), ai.clone());
     let mut translation_events = translation.subscribe();
     let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai, chat.clone());
     let (notifier, _outbox) = crate::app::notify::channel();
@@ -3042,6 +3092,7 @@ async fn auto_mode_requests_fire_without_a_pending_placeholder() {
         ChatServices {
             chat: chat.clone(),
             translation,
+            summary,
             notifications,
             articles,
             feeds: crate::app::chat::feeds::svc::FeedService::new(db.clone()),
@@ -3052,8 +3103,12 @@ async fn auto_mode_requests_fire_without_a_pending_placeholder() {
                 "http://127.0.0.1:1".to_string(),
             ),
         },
-        viewer.id,
-        crate::authz::Permissions::new(false, false),
+        ChatSession {
+            user_id: viewer.id,
+            username: viewer.username.clone(),
+            permissions: crate::authz::Permissions::new(false, false),
+            device_left_at: None,
+        },
         None,
         notifier,
         crate::app::ai::ladder::MentionLadders::new(),
@@ -3194,6 +3249,7 @@ async fn author_shared_translations_show_without_auto_mode_or_t() {
     let chat = crate::app::chat::svc::ChatService::new(db.clone(), notifications.clone());
     let ai = crate::app::ai::svc::AiService::new(false, None);
     let translation = crate::app::ai::translate::TranslationService::new(db.clone(), ai.clone());
+    let summary = crate::app::ai::summary::SummaryService::new(db.clone(), ai.clone());
     let mut translation_events = translation.subscribe();
     let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai, chat.clone());
     let (notifier, _outbox) = crate::app::notify::channel();
@@ -3201,6 +3257,7 @@ async fn author_shared_translations_show_without_auto_mode_or_t() {
         ChatServices {
             chat,
             translation: translation.clone(),
+            summary,
             notifications,
             articles,
             feeds: crate::app::chat::feeds::svc::FeedService::new(db.clone()),
@@ -3211,8 +3268,12 @@ async fn author_shared_translations_show_without_auto_mode_or_t() {
                 "http://127.0.0.1:1".to_string(),
             ),
         },
-        viewer.id,
-        crate::authz::Permissions::new(false, false),
+        ChatSession {
+            user_id: viewer.id,
+            username: viewer.username.clone(),
+            permissions: crate::authz::Permissions::new(false, false),
+            device_left_at: None,
+        },
         None,
         notifier,
         crate::app::ai::ladder::MentionLadders::new(),
@@ -3470,4 +3531,390 @@ fn parse_golive_clamps_titles_at_the_boundary() {
         }
         other => panic!("expected clamped obs title, got {other:?}"),
     }
+}
+
+#[test]
+fn parse_summary_arg_names_every_outcome() {
+    use crate::app::ai::summary::SUMMARY_MAX_WINDOW_HOURS;
+
+    // Bare `/summary` (the argument is whatever followed the command, so a
+    // trailing space is the same thing).
+    assert_eq!(parse_summary_arg(""), SummaryArg::CatchUp);
+    assert_eq!(parse_summary_arg("   "), SummaryArg::CatchUp);
+
+    // Both units, and the boundary that is still allowed.
+    assert_eq!(
+        parse_summary_arg(" 6h"),
+        SummaryArg::Window(chrono::Duration::hours(6))
+    );
+    assert_eq!(
+        parse_summary_arg(" 90m"),
+        SummaryArg::Window(chrono::Duration::minutes(90))
+    );
+    assert_eq!(
+        parse_summary_arg(" 6H"),
+        SummaryArg::Window(chrono::Duration::hours(6))
+    );
+    assert_eq!(
+        parse_summary_arg(&format!(" {SUMMARY_MAX_WINDOW_HOURS}h")),
+        SummaryArg::Window(chrono::Duration::hours(SUMMARY_MAX_WINDOW_HOURS))
+    );
+
+    // Past the max: refused, never quietly clamped, so a summary is never
+    // narrower than the window it was asked for.
+    assert_eq!(
+        parse_summary_arg(&format!(" {}h", SUMMARY_MAX_WINDOW_HOURS + 1)),
+        SummaryArg::TooLong
+    );
+    assert_eq!(parse_summary_arg(" 4000m"), SummaryArg::TooLong);
+    // Big enough to overflow a naive hours-to-minutes multiply.
+    assert_eq!(parse_summary_arg(" 4000000000h"), SummaryArg::TooLong);
+
+    // Empty windows.
+    assert_eq!(parse_summary_arg(" 0h"), SummaryArg::TooShort);
+    assert_eq!(parse_summary_arg(" 0m"), SummaryArg::TooShort);
+
+    // Junk, and the near-misses that must not be guessed at: a unitless
+    // number, a negative, a decimal, and a wrong unit.
+    for junk in [
+        " 6",
+        " -6h",
+        " 1.5h",
+        " 6d",
+        " h",
+        " six hours",
+        " 6 h",
+        " 6hh",
+    ] {
+        assert_eq!(parse_summary_arg(junk), SummaryArg::Unparseable, "{junk:?}");
+    }
+}
+
+/// Minimal room for the `/summary` command gate; the branch reads only
+/// `visibility` (and `id` for the request).
+fn summary_room(visibility: &str) -> ChatRoom {
+    ChatRoom {
+        id: Uuid::now_v7(),
+        created: Utc::now(),
+        updated: Utc::now(),
+        kind: "topic".to_string(),
+        visibility: visibility.to_string(),
+        auto_join: false,
+        permanent: false,
+        slug: None,
+        language_code: None,
+        dm_user_a: None,
+        dm_user_b: None,
+        topic: None,
+        rules: None,
+        created_by: None,
+    }
+}
+
+/// The AFK line marks a discontinuity in attention, so what it must get
+/// right is *where* the silence started, and that it stays put once placed.
+#[tokio::test]
+async fn the_afk_line_lands_where_the_silence_started_and_stays_there() {
+    let test_db = crate::test_helpers::new_test_db().await;
+    let user = late_core::test_utils::create_test_user(&test_db.db, "afk_place").await;
+    let mut state = chat_state_with_cyberspace(&test_db, user.id).0;
+    let room = summary_room("public");
+    let room_id = room.id;
+    state.visible_room_id = Some(room_id);
+    state.rooms.push((room, Vec::new()));
+
+    // Under the threshold nothing happens: a pause is not an absence.
+    assert!(!state.sync_afk_line(super::AFK_LINE_IDLE - Duration::from_secs(1)));
+    assert_eq!(state.afk_lines.get(&room_id), None);
+
+    // Over it, the line goes where the keyboard went quiet, not where the
+    // session noticed. Those are the same instant only by accident.
+    let before = Utc::now();
+    assert!(state.sync_afk_line(super::AFK_LINE_IDLE));
+    let placed = *state.afk_lines.get(&room_id).expect("line placed");
+    let expected = before - chrono::Duration::from_std(super::AFK_LINE_IDLE).unwrap();
+    assert!(
+        (placed - expected).num_seconds().abs() <= 1,
+        "line at {placed}, expected about {expected}"
+    );
+
+    // Staying away longer does not drag the line forward: it says when you
+    // left, and four hours later you still left when you left.
+    assert!(!state.sync_afk_line(Duration::from_secs(4 * 60 * 60)));
+    assert_eq!(*state.afk_lines.get(&room_id).expect("line kept"), placed);
+}
+
+/// The rule in one sentence: from when you went quiet until you speak again.
+/// Speaking is the clear, and only your own voice counts.
+#[tokio::test]
+async fn speaking_in_the_room_clears_its_line_but_being_spoken_to_does_not() {
+    let test_db = crate::test_helpers::new_test_db().await;
+    let user = late_core::test_utils::create_test_user(&test_db.db, "afk_speak").await;
+    let other = late_core::test_utils::create_test_user(&test_db.db, "afk_other").await;
+    let mut state = chat_state_with_cyberspace(&test_db, user.id).0;
+    let room = summary_room("public");
+    let room_id = room.id;
+    state.visible_room_id = Some(room_id);
+    state.rooms.push((room, Vec::new()));
+    assert!(state.sync_afk_line(super::AFK_LINE_IDLE));
+
+    let message = |author: Uuid, body: &str| late_core::models::chat_message::ChatMessage {
+        id: Uuid::now_v7(),
+        created: Utc::now(),
+        updated: Utc::now(),
+        reply_to_message_id: None,
+        reply_to_user_id: None,
+        room_id,
+        user_id: author,
+        body: body.to_string(),
+    };
+
+    // The backlog piling up under the line is the line doing its job.
+    state.push_message(message(other.id, "while you were out"));
+    assert!(state.afk_lines.contains_key(&room_id));
+
+    // Your own message ends the silence the line was marking.
+    state.push_message(message(user.id, "back"));
+    assert_eq!(state.afk_lines.get(&room_id), None);
+}
+
+/// A room you are not looking at was never being attended, so it collects
+/// nothing; its rail badge already says what is waiting there.
+#[tokio::test]
+async fn only_the_room_on_screen_collects_a_line() {
+    let test_db = crate::test_helpers::new_test_db().await;
+    let user = late_core::test_utils::create_test_user(&test_db.db, "afk_scope").await;
+    let mut state = chat_state_with_cyberspace(&test_db, user.id).0;
+    let watched = summary_room("public");
+    let watched_id = watched.id;
+    let background = summary_room("public");
+    let background_id = background.id;
+    state.visible_room_id = Some(watched_id);
+    state.rooms.push((watched, Vec::new()));
+    state.rooms.push((background, Vec::new()));
+
+    assert!(state.sync_afk_line(super::AFK_LINE_IDLE));
+
+    assert!(state.afk_lines.contains_key(&watched_id));
+    assert_eq!(state.afk_lines.get(&background_id), None);
+}
+
+/// Both catch-up surfaces read the line and neither spends it. `/history`
+/// is how you go and look, and the anchor has to survive the looking;
+/// `/summary` tells you what is below the line, it does not move where the
+/// line is. Only speaking does that.
+#[tokio::test]
+async fn neither_a_summary_nor_history_spends_the_line() {
+    let test_db = crate::test_helpers::new_test_db().await;
+    let user = late_core::test_utils::create_test_user(&test_db.db, "afk_catchup").await;
+    let mut state = chat_state_with_cyberspace(&test_db, user.id).0;
+    let room = summary_room("public");
+    let room_id = room.id;
+    state.visible_room_id = Some(room_id);
+    state.selected_room_id = Some(room_id);
+    state.rooms.push((room, Vec::new()));
+    assert!(state.sync_afk_line(super::AFK_LINE_IDLE));
+    let placed = *state.afk_lines.get(&room_id).expect("line placed");
+
+    state.composer.insert_str("/history");
+    state.submit_composer(false, false);
+    assert_eq!(state.afk_lines.get(&room_id), Some(&placed));
+
+    state.composer.insert_str("/summary");
+    let banner = state.submit_composer(false, false).expect("banner");
+    assert_eq!(banner.message, "Summarizing…");
+    assert_eq!(state.afk_lines.get(&room_id), Some(&placed));
+}
+
+/// The two marks answer different questions and never feed each other: a
+/// bare `/summary` reads from when you last left the app on this device,
+/// whatever the room's AFK line says, and a device with no mark gets the
+/// default rather than the line.
+#[test]
+fn a_bare_summary_reads_the_device_mark_and_never_the_afk_line() {
+    let left_at = Utc::now() - chrono::Duration::hours(9);
+    assert_eq!(
+        super::catch_up_window(Some(left_at)),
+        SummaryWindow::SinceLeftApp(left_at)
+    );
+    assert_eq!(super::catch_up_window(None), SummaryWindow::Default);
+}
+
+#[tokio::test]
+async fn summary_command_refuses_non_public_rooms() {
+    let test_db = crate::test_helpers::new_test_db().await;
+    let user = late_core::test_utils::create_test_user(&test_db.db, "sum_cmd_priv").await;
+    let mut state = chat_state_with_cyberspace(&test_db, user.id).0;
+    let room = summary_room("private");
+    state.visible_room_id = Some(room.id);
+    state.rooms.push((room, Vec::new()));
+
+    state.composer.insert_str("/summary");
+    let banner = state.submit_composer(false, false).expect("banner");
+
+    assert_eq!(banner.message, "Summaries cover public rooms only");
+}
+
+#[tokio::test]
+async fn summary_command_requests_the_visible_public_room() {
+    let test_db = crate::test_helpers::new_test_db().await;
+    let user = late_core::test_utils::create_test_user(&test_db.db, "sum_cmd_pub").await;
+    let mut state = chat_state_with_cyberspace(&test_db, user.id).0;
+    let room = summary_room("public");
+    let room_id = room.id;
+    state.visible_room_id = Some(room_id);
+    state.rooms.push((room, Vec::new()));
+    let mut events = state.summary_service.subscribe();
+
+    state.composer.insert_str("/summary");
+    let banner = state.submit_composer(false, false).expect("banner");
+    assert_eq!(banner.message, "Summarizing…");
+
+    // AI is disabled in this wiring, so the issued request answers
+    // Unavailable; its arrival is the proof a request went out for this
+    // user and room.
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+        .await
+        .expect("event within timeout")
+        .expect("channel open");
+    assert_eq!(event.user_id, user.id);
+    assert_eq!(event.room_id, room_id);
+    assert!(matches!(event.outcome, SummaryOutcome::Unavailable));
+}
+
+#[tokio::test]
+async fn summary_command_refuses_a_malformed_window_without_requesting() {
+    let test_db = crate::test_helpers::new_test_db().await;
+    let user = late_core::test_utils::create_test_user(&test_db.db, "sum_cmd_bad").await;
+    let mut state = chat_state_with_cyberspace(&test_db, user.id).0;
+    let room = summary_room("public");
+    state.visible_room_id = Some(room.id);
+    state.rooms.push((room, Vec::new()));
+    let mut events = state.summary_service.subscribe();
+
+    state.composer.insert_str("/summary 6");
+    let banner = state.submit_composer(false, false).expect("banner");
+
+    // The banner teaches the format, and nothing was spent: a typo must not
+    // fall back to the default window and answer the wrong question.
+    assert_eq!(banner.message, "Use /summary, or a window like /summary 6h");
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn a_ready_summary_waits_for_an_open_overlay_instead_of_clobbering_it() {
+    let test_db = crate::test_helpers::new_test_db().await;
+    let user = late_core::test_utils::create_test_user(&test_db.db, "sum_overlay").await;
+    let mut state = chat_state_with_cyberspace(&test_db, user.id).0;
+    state.overlay = Some(Overlay::new("Rules", vec!["be kind".to_string()]));
+
+    state.summary_service.emit_for_test(SummaryEvent {
+        user_id: user.id,
+        room_id: Uuid::now_v7(),
+        room_label: "#lounge".to_string(),
+        outcome: SummaryOutcome::Ready {
+            text: "- alice shipped the thing".to_string(),
+            message_count: 3,
+            since: Utc::now() - chrono::Duration::hours(2),
+            basis: SummaryBasis::Explicit,
+            capped: false,
+            truncated: false,
+        },
+    });
+    let tick = state.tick();
+
+    // The overlay the user is reading stays; a banner says the summary
+    // waits for the surface.
+    assert_eq!(
+        state.overlay.as_ref().map(|o| o.title.as_str()),
+        Some("Rules")
+    );
+    assert_eq!(
+        tick.banner.expect("banner").message,
+        "Summary ready, close the open panel to view"
+    );
+
+    // Closing it hands the surface to the waiting summary, and the tick
+    // reports the change so the frame redraws.
+    state.overlay = None;
+    let tick = state.tick();
+    assert!(tick.changed);
+    assert_eq!(
+        state.overlay.as_ref().map(|o| o.title.as_str()),
+        Some("#lounge catch-up")
+    );
+}
+
+/// The catch-up head is the one absolute time in the overlay, so it is
+/// written on the reader's clock when the account has a zone.
+#[tokio::test]
+async fn a_ready_summary_dates_its_window_in_the_viewers_timezone() {
+    use chrono::TimeZone;
+
+    let test_db = crate::test_helpers::new_test_db().await;
+    let user = late_core::test_utils::create_test_user(&test_db.db, "sum_tz").await;
+    let mut state = chat_state_with_cyberspace(&test_db, user.id).0;
+    let since = Utc
+        .with_ymd_and_hms(2026, 8, 28, 14, 30, 0)
+        .single()
+        .unwrap();
+    let emit = |state: &mut ChatState| {
+        state.summary_service.emit_for_test(SummaryEvent {
+            user_id: user.id,
+            room_id: Uuid::now_v7(),
+            room_label: "#lounge".to_string(),
+            outcome: SummaryOutcome::Ready {
+                text: "- alice shipped the thing".to_string(),
+                message_count: 3,
+                since,
+                basis: SummaryBasis::Explicit,
+                capped: false,
+                truncated: false,
+            },
+        });
+        state.tick();
+    };
+
+    state.set_viewer_tz(Some(chrono_tz::Europe::Warsaw));
+    emit(&mut state);
+    assert_eq!(
+        state.overlay.as_ref().expect("overlay").lines[0],
+        "3 messages since Aug 28 16:30 CEST"
+    );
+
+    // No account zone: the window stays UTC, and says so.
+    state.overlay = None;
+    state.set_viewer_tz(None);
+    emit(&mut state);
+    assert_eq!(
+        state.overlay.as_ref().expect("overlay").lines[0],
+        "3 messages since Aug 28 14:30 UTC"
+    );
+}
+
+#[test]
+fn selection_scroll_steps_within_measured_overflow_and_reports_edges() {
+    let scroll = SelectionScroll::default();
+    // No measurement yet (or a selection that fits): every step falls
+    // through to selection movement.
+    assert!(!scroll.step(1));
+    assert!(!scroll.step(-1));
+
+    scroll.overflow.set(3);
+    assert!(scroll.step(1));
+    assert!(scroll.step(1));
+    assert!(scroll.step(1));
+    assert_eq!(scroll.rows.get(), 3);
+    // The bottom edge is reached: the next step falls through.
+    assert!(!scroll.step(1));
+
+    assert!(scroll.step(-1));
+    assert_eq!(scroll.rows.get(), 2);
+
+    scroll.reset();
+    assert_eq!(scroll.rows.get(), 0);
+    assert!(!scroll.step(1));
 }

@@ -201,10 +201,12 @@ impl State {
         self.message = format!("Daily {} board.", self.difficulty_label());
     }
 
-    pub fn ensure_current_daily(&mut self) {
+    /// Roll the dailies forward when the UTC date changes under a live
+    /// session. Returns true when it moved.
+    pub fn ensure_current_daily(&mut self) -> bool {
         let today = Utc::now().date_naive();
         if self.puzzle_date == today {
-            return;
+            return false;
         }
         self.puzzle_date = today;
         self.daily_snapshots = DIFFICULTIES
@@ -213,6 +215,7 @@ impl State {
         if self.mode == Mode::Daily {
             self.message = "Today's Sliding Puzzle is ready.".to_string();
         }
+        true
     }
 
     pub fn show_daily(&mut self) {
@@ -262,7 +265,15 @@ impl State {
         }
     }
 
+    /// Two-press reset confirm. Refused outright on a solved daily: the win
+    /// is already banked, so re-scrambling would only put a finished puzzle
+    /// back on the board and write the scramble over the solved row.
     pub fn request_reset(&mut self) -> bool {
+        if self.mode == Mode::Daily && self.is_solved() {
+            self.reset_pending = None;
+            self.message = "Today's board is solved and banked; try another difficulty or p for a personal board.".to_string();
+            return false;
+        }
         let message = match self.mode {
             Mode::Daily => "Press r or 0 again to restore today's scramble.",
             Mode::Personal => "Press r or 0 again to restore this personal scramble.",
