@@ -98,12 +98,17 @@ North-star check, borrowed from GAME.md: **does it ship a story into
 | Crown ratchet | next price = max(500, ceil(paid x 1.5)), 100% burned: 500 / 750 / 1,125 / 1,688 / 2,532 / 3,798 / 5,697 / 8,546 from empty |
 | Crown hold | none (removed 2026-08-26: a hold turned month end into a clock game around the hold window; without it the last take before midnight wins, and the 1.5x ladder is the only throttle) |
 | Crown reset | UTC month boundary; month-end holder gets a `profile_awards` row |
-| Burn milestones | 100,000 / 500,000 / 1,000,000 |
+| Burn milestones | 🕯️ Wick 50,000 / 🧨 Fuse 150,000 / 🌋 Furnace 500,000 (lowered from 100,000 / 500,000 / 1,000,000 on 2026-08-26, when the ultimates came down to 1M and took the ceiling) |
+| Ultimate spell | 1,000,000 (lowered from 10,000,000 on 2026-08-26: at ten million neither spell ever sold, and the shop's ceiling belongs on a thing people can actually reach) |
 | Pot ticket | 100 chips |
-| Pot per-user cap | 50 tickets per pot |
+| Pot per-user cap | 10 tickets per UTC day, 70 a week (was 50 per pot while the pot was daily; decided 2026-08-27) |
 | Pot payout | 80% of ticket sum to one ticket-weighted winner; 20% never re-minted |
-| Pot draw hour | 21:00 UTC, one constant |
-| Pot threshold lines | 50,000 and 100,000, once each per pot |
+| Pot draw | Monday 21:00 UTC, two constants (weekly since 2026-08-27; the hour is the EU evening / US afternoon overlap) |
+| News share | 500 per link, once per URL per person, at most 3 paid per UTC day (PR #565; the only chip reward outside the Shop and the games, and `s` on an RSS entry is one keypress, so the day cap is what keeps an inbox from being a printer) |
+| Pot threshold lines | none (removed 2026-08-27, migration 162: the size rides the status HUD on every screen all week, so a mid-week #lounge nudge repeated the border) |
+| Round price | 100 a head, matching the cheapest pour: a round is a lot of small kindnesses, and the room's size is the only multiplier |
+| Round drink | 300 drunk points, three times what the buyer paid and exactly the buzzed threshold, so a sober room visibly moves a level; the buzz is free to hand out, only the chips are a sink |
+| Round credit | one open per patron at a time, 24h to claim, cashed by ordering from @bartender |
 
 ## Process
 
@@ -145,9 +150,10 @@ Behavior:
   `ends_at = now + duration_secs`, deactivating any live row of the same
   `effect_kind` for that user (one active badge, one active flag; a rebuy
   across tiers replaces). Mirror `activate_username_effect_in_tx`.
-- The chat label query prefers a live rental row over the legacy permanent
-  purchase, so existing owners keep what they bought until they rent
-  something over it. Legacy permanent badge/flag SKUs go `active = false`.
+- Legacy permanent badge/flag SKUs go `active = false`. The chat label
+  query preferred a live rental over the legacy permanent purchase so
+  existing owners kept what they bought; migration 165 closed that out (see
+  the follow-up below) and the query now reads the rental alone.
 - Shop copy quotes the duration through one reader the way
   `username_effect_duration_secs` does; the detail pane shows the active
   row and remaining time; `ShopState::tick` prunes at `ends_at`.
@@ -166,7 +172,7 @@ Acceptance:
 - [x] One active badge and one active flag per user, rebuy replaces, month
       over day replaces, clock resets.
 - [x] Legacy owners still render their permanent badge when no rental is
-      live.
+      live. Superseded by the follow-up below.
 - [x] Rental expiry removes the badge from chat labels with no background
       task (decay-at-read or the existing `ends_at` prune path).
 - [x] Two SSH replicas agree within one refresh (notify path documented).
@@ -178,6 +184,19 @@ Acceptance:
 
 Out of scope: any new badge art, pricing changes beyond the table above,
 titles.
+
+Follow-up done (migration 165): the permanent equips are gone. Keeping them
+readable left two things broken. An owner could never be shown as active in
+the Shop, because the retired SKU is not in the catalog and no listed row
+could carry the marker. And a rented flag only masked the permanent one,
+which came back at expiry, so a permanent owner could never end up wearing
+nothing. 165 clears every `chat_badge`/`chat_flag` equip and grants each
+owner 30 days of the same emoji through the month SKU, which is a real
+rental: the Shop shows it active with its remaining time and it lapses on
+its own. Someone already renting over their permanent badge keeps their own
+clock and is granted nothing, since one live row per (user, effect kind) is
+the invariant. `bonsai_variant` is now the only slot anything equips, so the
+Shop's clear-badge key and the permanent-badge branches went with it.
 
 ## Phase 1: title rental
 
@@ -433,33 +452,99 @@ the Shop modal.
 
 ## Phase 4: burn milestones
 
-Goal: fill the empty price band between 5k and 10M with three permanent
-badges that only those prices buy.
+Goal: fill the empty price band above the rentals with three permanent
+badges that only those prices buy, and bring the shop's ceiling down to
+somewhere a whale can actually reach.
 
 Behavior:
-- Migration seeds three permanent items at 100,000 / 500,000 / 1,000,000
-  in the Ultimates tab (rename the tab if "Ultimates" no longer fits, the
-  category enum is closed), each with a unique emoji not used by any
-  rental badge, shown in the permanent badge position the legacy path
-  still supports after Phase 0.
+- Migration seeds three permanent items, one emoji each, none of them used
+  by any rental badge, flag, or the crown:
+
+  | SKU | Name | Emoji | Price |
+  |---|---|---|---|
+  | `milestone_wick` | Wick | 🕯️ | 50,000 |
+  | `milestone_fuse` | Fuse | 🧨 | 150,000 |
+  | `milestone_furnace` | Furnace | 🌋 | 500,000 |
+
+  The ladder is heat: the badge is the fire you paid for. Names stay one
+  word so they fit a chat label and a #lounge line without wrapping.
+- The same migration drops `ultimate_wonderland` and `ultimate_thematrix`
+  from 10,000,000 to 1,000,000 (`ON CONFLICT (sku) DO UPDATE`, the shape
+  migration 059 already ships). Nothing else about the spells changes.
 - **Do not seed them as `item_kind = 'badge'`.** Migration 148 ends with
   `UPDATE marketplace_items SET active = false WHERE item_kind = 'badge'`,
   and its header invites re-running its INSERT shape for new badges; a
   permanent milestone seeded as `badge` would be retired by any such
-  re-run. Use a distinct kind (`milestone_badge`) that the chat label
-  query's legacy join reads through the same `equipped_slot` path.
-- Purchase announces through `ActivityKind::BurnMilestone { amount }` with
-  a lounge arm: "mira burned 500,000 chips for the <name>".
+  re-run. Use a distinct kind (`milestone_badge`).
+- **A milestone is a fourth glyph, not a badge slot.** It renders after the
+  rental badge and flag, never in place of either: a player wearing a
+  rented cat and a pride flag who burns 500,000 shows all three. This is
+  the one thing the chat label query must not get wrong, since the whole
+  purchase is the glyph. Add a column to the query in
+  `late-core/src/models/user.rs` (~578) beside `chat_badge` and
+  `chat_flag`; it reads `user_purchases` joined on the milestone kind, with
+  no `equipped_slot` and no rental LATERAL, because a milestone never
+  expires and is never rented over.
+- **Highest owned wins, automatically.** Owning Fuse and Furnace shows the
+  Furnace. No equip flow, no slot column, no new state: the ladder only
+  goes up, so the highest is the one a buyer would pick anyway. The query
+  orders by price and takes one.
+- The Ultimates tab holds all five items, so
+  `ShopCategory::Ultimates => item.is_ultimate_spell()`
+  (`late-ssh/src/app/hub/shop/catalog.rs:60`) becomes an arm that admits
+  the milestone kind too, and `hub/shop/ui.rs:275` stops assuming an
+  ultimate-tab row is castable. The tab label is a free rename if
+  "Ultimates" stops fitting; the variant stays.
+- Purchase announces through `ActivityKind::BurnMilestone { amount, name }`
+  with a lounge arm: "mira burned 150,000 chips for the Fuse".
+
+Status: shipped 2026-08-26 (migration 157,
+`late-core/src/models/milestone.rs`, the flair directory). Deviations from the
+design above, each deliberate:
+- The glyph rides **`NameFlair` / `ResolvedName`**, the crown's map, not a
+  fourth column on the chat label query. The design said to add one beside
+  `chat_badge` and `chat_flag`, but those reach the renderer as a single
+  joined string that `chat_badge_display_parts` splits back apart by
+  detecting flag prefixes; a third value in that string would have to be
+  recovered by matching against the three known emoji. The flair map is
+  already read at every author header, already resolves on the once-a-second
+  edge, and already carries the crown for exactly this reason.
+- `refresh_user_flair` therefore has to read the milestone even though
+  nothing about a purchase expires: that path rebuilds the whole entry, so
+  leaving it out would drop a 500,000-chip glyph the moment its owner rented
+  a badge.
+- The milestone takes its **own click target** (`HeaderTarget::StoreMilestone`
+  -> the Ultimates tab). Sharing `StoreBadge` would have sent a click on the
+  dearest item in the shop to the tab that sells hundred-chip cats.
+- The Ultimates tab gained **section rows** ("Burn milestones" /
+  "Ultimate spells", `ultimates_section_label`). Five items at two unrelated
+  price bands, one of which repaints the server for ten seconds and one of
+  which does nothing at all, should not read as one list.
+- **Not on the profile modal.** The acceptance list said "chat labels and the
+  profile", but the profile modal renders a bare username today: no badge, no
+  flag, no crown, no title. There is no surface to hang a milestone on, and
+  inventing one is a bigger change than the rest of this phase. Left out on
+  purpose; if the profile ever grows a worn-items row, every one of these
+  belongs on it, not just the milestone.
 
 Acceptance:
-- [ ] Migration only, plus the activity hook on the existing purchase
-      path and its filter arm.
-- [ ] A purchased milestone renders in chat labels and the profile.
-- [ ] Help copy and `hub/CONTEXT.md`.
+- [x] Migration seeds the three milestones and reprices both ultimate
+      spells; no other catalog row moves.
+- [x] A purchased milestone renders in chat labels alongside a live rental
+      badge and a live rental flag, all three at once.
+- [x] Owning two milestones shows the dearer one, in one query, for every
+      viewer.
+- [x] The Ultimates tab lists all five and refuses to cast a milestone.
+- [x] Help copy, `hub/CONTEXT.md`, `chat/CONTEXT.md`, root `CONTEXT.md`.
+- [ ] Profile rendering: no surface exists (see the deviation above).
+
+Out of scope: milestone-only chat colors, a fourth rung, retiring the
+ultimate spells, any equip choice between milestones.
 
 ## Phase 5: the pot
 
-Goal: a daily parimutuel raffle. The biggest sink that works at any
+Goal: a parimutuel raffle (daily as designed, weekly as shipped, see the
+status below). The biggest sink that works at any
 concurrency, one story a day, and the arena's betting engine (GAME.md
 phase 4) built early. Do not generalize it into a "pool" abstraction; the
 arena copies the shape when it exists.
@@ -489,7 +574,7 @@ Behavior:
   tops Top Chips). The next pot is inserted in the same transaction with
   `draws_at` = the next 21:00 UTC, so there is always exactly one open
   pot.
-- Sidebar: a two-row "Pot" panel in the roster in
+- Sidebar (removed 2026-08-28, see the status block): a two-row "Pot" panel in the roster in
   `late-ssh/src/app/common/sidebar.rs`, on by default for new panel lists
   and appended for stored lists (read how legacy `"activity"` entries are
   dropped on read and do the inverse), shrink priority just above the
@@ -504,18 +589,83 @@ Behavior:
   `pot_changed` notify. No `notifications` row (that table is
   mention-bound).
 
+Status: shipped 2026-08-27 (migration 160, `late-core/src/models/pot.rs`,
+`late-ssh/src/app/pot/`). Deviations from the design above, each deliberate:
+- **Weekly, not daily**, drawn Monday 21:00 UTC, and the cap is **10 a
+  day** rather than N per pot (decided 2026-08-27, same day). At the clubhouse's size a daily pot is a few
+  thousand chips, the 50k / 100k threshold lines would never fire, and empty
+  days rolling would quietly say nobody plays. One real story a week, a
+  countdown in days, and a daily cap so nobody can buy the week on Monday:
+  the raffle is about showing up seven times, and 1,000 chips a day is an
+  arcade afternoon, reachable by anyone who plays. The pot therefore stops
+  being a whale sink (7,000 a week per player at most); the crown and the
+  milestones are the whale sinks. No schema change: `next_draw_at` picks the
+  next Monday, `short_duration` learned days, and the cap check in the insert
+  counts today's rows (`created` on today's UTC date) instead of the pot's. The 21:00 hour stays as the EU evening / US
+  afternoon overlap.
+- **The pot also rides the status HUD**, `pot 84,200 · 4d12h` right before
+  the chips so the prize reads against the viewer's balance, on every
+  screen. It sheds first under a tight border (countdown, then itself).
+- **No sidebar panel** (removed 2026-08-28). The HUD badge already carries
+  the size and the countdown on every screen, so the two-row panel spent
+  rail rows on a second copy of the border; `/pot` remains the full read.
+  `RightSidebarComponent::Pot` and `pot/panel.rs` are gone, and a stored
+  `"pot"` key is dropped on read by `from_key` exactly like the retired
+  `"activity"` and `"visualizer"` keys, so no settings migration is needed.
+- **`/pot` costs no query.** The design put "the caller's ticket count" in
+  the `watch` snapshot, which a process-wide watch cannot carry. Instead
+  `PotSnapshot` holds a private `HashMap<Uuid, i64>` of holdings and
+  `tickets_for(user_id)` is the only way out of it, so the HUD badge and the
+  `/pot` line both read owned memory and no session can widen the read. The
+  snapshot is one aggregate query per refresh, which the draw needs anyway.
+  `PotEvent` therefore has no `Status` variant: the command is answered
+  synchronously in `tick_pot` rather than through a task.
+- **The draw posts a headline as well as a ticker line.** The design's own
+  requirement was that an offline winner reads the result on return, and a
+  `· ` ticker line is diverted out of the TUI message list; only a headline
+  (a real un-prefixed `system` message, `filter::lounge_headline`) is a row
+  they can still read. The crown was that arm's only occupant until now.
+- **`ChipMove::PotTicket` is `counts_as_earnings = false` too.** The design
+  only decided the win. Excluding the win and counting the ticket would make
+  buying into the pot a pure negative on a board the winner cannot climb
+  back up, so both sides are out.
+- **No threshold lines.** They shipped as a high-water column
+  (`pots.announced_threshold`, claimed by a guarded `UPDATE`) and were
+  removed the same day (migration 162) once the pot moved into the status
+  HUD: the size is on every screen all week, so a mid-week #lounge nudge
+  only repeated what the border said. The draw is the pot's one story.
+- **`ticket_count`, `payout_chips`, `winner_user_id`, `drawn_at` are
+  nullable**, stamped once at the draw, with one CHECK per status so a
+  half-settled row cannot exist. A drawn pot is told from a rolled one by
+  `ticket_count > 0` rather than by the winner, because the winner's account
+  can be deleted out from under a settled row (`ON DELETE SET NULL`); history
+  keeps what was paid and the ledger keeps who was paid.
+- **The buy holds the pot row `FOR UPDATE`** on top of the in-query cap
+  check. The check alone is not exact: two concurrent buys by one player
+  would read the same sum and both pass. The row lock also means a buy that
+  arrives exactly as the sweeper draws is refused uncharged
+  (`PotRefusal::Closed`) instead of landing in a settled pot.
+- **`ensure_open` is folded into `settle_due`.** The migration seeds no pot,
+  so the sweeper's first pass opens one; that is the same advisory lock and
+  the same transaction that would otherwise have needed a second path.
+- **The panel is two rows of left/right pairs**, not the wide single line the
+  design sketched: the rail is 24 columns and the panel draws into 21, so
+  `pot 84,200 · 312 tickets · draws in 3h12m` was never going to fit. It
+  reads `84,200 / in 3h12m` over `842 tickets / you 5`, and dashes before the
+  first refresh.
+
 Acceptance:
-- [ ] Buy: cap enforced in the query, floor guard, ledger row per buy.
-- [ ] Draw: two replicas sweeping the same pot produce one payout; zero
+- [x] Buy: cap enforced in the query, floor guard, ledger row per buy.
+- [x] Draw: two replicas sweeping the same pot produce one payout; zero
       tickets rolls; the next pot always exists after a draw.
-- [ ] Whole-state test of the draw from a fixed seed and fixed tickets.
-- [ ] Payout math: winner receives `floor(size * 0.8)`, the ledger shows
+- [x] Whole-state test of the draw from a fixed seed and fixed tickets.
+- [x] Payout math: winner receives `floor(size * 0.8)`, the ledger shows
       the 20% gap.
-- [ ] Panel renders on Home and Arcade, shrinks in the right order, and
+- [x] ~~Panel renders on Home and Arcade, shrinks in the right order, and
       the stored panel list of an existing user gains it without a
-      settings migration.
-- [ ] Threshold lines fire once each per pot across restarts.
-- [ ] Tests beside the model, the service, the sidebar, and the activity
+      settings migration.~~ Removed, see the status block.
+- [x] ~~Threshold lines fire once each per pot across restarts.~~ Removed, see the status block.
+- [x] Tests beside the model, the service, the sidebar, and the activity
       filter; help copy; new `late-ssh/src/app/pot/CONTEXT.md` plus the
       root routing table row.
 
@@ -554,10 +704,10 @@ What the code says today (investigated 2026-08-25):
   line older than 7 days would pay again. The repeat claim therefore has to
   be keyed on the run's identity as well: `door_runs` and
   `door_milestones` carry `UNIQUE (game, source_file, source_offset)`, and
-  `insert_ignore` returns whether the row was fresh. NetHack's Amulet and
-  DCSS's Orb are granted twice per winning run (once from the milestone
-  line, once from the win line, `award.rs::grant`); the cooldown absorbs the
-  second sighting.
+  `insert_ignore` returns whether the row was fresh. (Before 2026-08-27
+  NetHack's Amulet and DCSS's Orb were also granted a second time off the
+  win line, as a backstop for a missed pickup line; see the deviation
+  below for why that is gone.)
 - **Green Dragon.** `Character::slay_dragon` bumps `dragon_kills` and resets
   the character to level 1 (gold and gems restart from the kill count), so
   the loop already exists in-game. `reward_dragon_kill(user_id, kills)`
@@ -589,7 +739,7 @@ Decided numbers (one number per milestone, no first/repeat split):
 | NetHack | Amulet / Ascension | 20,000 / 50,000 | run identity + 7-day lockout, each |
 | DCSS | Orb / Escape | 20,000 / 50,000 | run identity + 7-day lockout, each |
 | Brogue | Escape / Mastery | 20,000 / 50,000 | run identity + 7-day lockout, each |
-| Green Dragon | dragon kill | 20,000 | kill number per character row; the daily turn cap makes a kill 7-10 days |
+| Green Dragon | dragon kill | 10,000 (migration 159; was 20,000 in 158) | kill number per character row; the daily turn cap makes a kill 7-10 days |
 | A Dark Room | escape / beacon escape | 15,000 / 20,000 | run id; the run is the gate (~5 days) |
 | Lateania | Archdemon, Frontier King | 10,000 each | once per `mud_characters.id` AND 7-day lockout per crown per account |
 | Lateania | Yssgar, Kaethyr | 20,000 each | same |
@@ -650,23 +800,83 @@ Behavior:
   under an hour means it is the best rate in the app and should drop to
   ~1,000 or take the lockout shape; multi-hour means it stays.
 
+Status: shipped 2026-08-26 (migration 158, `GamePayout::grant_multi` in
+`late-core/src/models/game_payout.rs`, `ChipService::credit_run_cooldown_reward_template`).
+Deviations from the design above, each deliberate:
+- The multi-key grant is `GamePayout::grant_multi` over a closed
+  `GamePayoutKey` enum (`Unique { period_kind, period_key }` /
+  `Cooldown { period_kind, window }`), not a cooldown flag hung off one key.
+  A gate is either an identity or a rate limit, and a match arm per gate reads
+  the way the callers do.
+- **Every claim row in a multi-key grant carries the full amount.** The
+  design said several rows, one payout; the table's
+  `CHECK (amount > 0)` forbids recording a zero on the companion rows, and
+  relaxing an applied migration's CHECK for a bookkeeping nicety was the worse
+  trade. `chip_ledger` takes exactly one row per credited grant and is the
+  money witness; `game_payout_claims.amount` is per-claim record. The ingest
+  test helper that summed claim rows now sums the ledger instead.
+- `grant_cooldown` and `grant_multi` share one advisory lock helper
+  (`lock_payout`), on the same `(user, game, payout_kind, 'cooldown')` key
+  `grant_cooldown` already used, so the two paths can never race each other on
+  one payout even though no template uses both today.
+- Green Dragon's character row id is read in the grant task through a new
+  `GreenDragonCharacter::id_for_user`. The design said "load the id with the
+  character", but every existing load returns the opaque blob and nothing
+  else; threading an id through them all to serve one fire-and-forget task
+  would have touched a dozen call sites for no other reader.
+- A Dark Room's `run_id` is a plain `Uuid` with
+  `#[serde(default = "Uuid::now_v7")]`, not an `Option` upgraded on load. Same
+  behaviour for an old blob (it deserializes with an id of its own rather than
+  a nil one every old save would share), and the in-memory game can never be
+  without one, so the ending has nothing to unwrap.
+- Lateania's character slot is resolved in `publish_kill_outcome` from the
+  service's `live_slot` binding (falling back to `active_slot`, the rule
+  `publish` already uses) rather than added to `KillOutcome`. The world state
+  carries no slot at all: the binding lives on the service, and the read
+  happens one step after the tick that produced the kill.
+- Two copy sites the investigation missed are fixed in the same pass:
+  `door/greendragon/ui.rs` ("the chip payout is a lifetime claim") and
+  `door/lateania/screen.rs`, which still said Yssgar and Kaethyr pay "no
+  chips, only glory", stale since migration 144 flattened the crowns.
+- **No back-grant, found in verification 2026-08-27.** `award.rs::grant` used
+  to pay the Orb / Amulet a second time off the win line ("in case the
+  milestone stream missed it"), and the NetHack xlogfile `achieve` bit paid
+  the Amulet off a death line. Under the new gate the back-grant carried the
+  win line's own key, so the only thing stopping it was the 7-day window:
+  a run whose pickup and win were more than a week apart paid the pickup
+  twice (90k for a DCSS run the table prices at 70k). Both backstops are
+  deleted, not re-keyed: a pickup line the pipe missed is an ingest bug
+  that has to surface as a missing badge, not get paid from somewhere else.
+  One line, one milestone, every door. The `NethackRun.amulet` field went
+  with it.
+- **A refused line can pay on a later replay** (noted in verification
+  2026-08-27, accepted). A win refused by the 7-day window writes no claim
+  row at all (all gates or none), so it looks fresh to a later re-read. A
+  cursor reset or backfill after the window therefore pays every win that
+  was refused inside its week, not only wins the pipe never saw. Only an
+  operator can trigger a re-read, and it sits inside the "backfilled
+  historical wins still grant" decision; know it before resetting a cursor.
+- The amounts are quoted in the in-door landings, the badge guide, and the
+  help modal because that is what a player reads, and in the CONTEXT.md files
+  that already quoted the old ones. Every one of those points back here.
+
 Checklist:
-- [ ] Migration: `reward_chips`, `claim_policy`, `cooldown_seconds`, and
+- [x] Migration: `reward_chips`, `claim_policy`, `cooldown_seconds`, and
       the description on the thirteen rows. Existing `lifetime` claim rows
       stay as history and must not block the first gated repeat (they have
       a different `period_kind`; add a test that proves it).
-- [ ] Multi-key grant in `game_payout.rs` with tests: all rows or none,
+- [x] Multi-key grant in `game_payout.rs` with tests: all rows or none,
       cooldown honoured, conflict on any key pays nothing, concurrent calls
       serialize under the lock.
-- [ ] Roguelikes: a replayed win line (same natural key) never pays twice;
+- [x] Roguelikes: a replayed win line (same natural key) never pays twice;
       a second distinct win inside 7 days pays nothing and the badge insert
       still no-ops; a win after 7 days pays.
-- [ ] Green Dragon: kill N pays once; a recreated character's kill 1 pays.
-- [ ] A Dark Room: `run_id` survives save/load, differs across runs, and an
+- [x] Green Dragon: kill N pays once; a recreated character's kill 1 pays.
+- [x] A Dark Room: `run_id` survives save/load, differs across runs, and an
       old save without one is upgraded on load.
-- [ ] Lateania: same character twice pays once; a second character inside
+- [x] Lateania: same character twice pays once; a second character inside
       7 days pays nothing; a second character after 7 days pays.
-- [ ] Copy sites above; door CONTEXT.md files, `door/ingest` notes, and the
+- [x] Copy sites above; door CONTEXT.md files, `door/ingest` notes, and the
       chips context updated; this table copied nowhere else (link here).
 
 Out of scope: new milestones, Lobby game stakes and the loser payout
@@ -710,7 +920,7 @@ Decided numbers:
 
 | Dial | Value |
 |---|---|
-| Paid results per opponent per UTC day | 1 (win payout and consolation both) |
+| Paid results per opponent per game per posting day | 1 (win payout; the claim is scoped to the roster game, decided 2026-08-27; the consolation was dropped) |
 | Consolation | 100 chips, flat, every roster game |
 | Consolation gate | `state.revision >= DailyGame::consolation_min_moves()`: chess and chess960 40, battleship 40, reversi 30, checkers 30, connect four 20, backgammon 20, briscola 20 (revision counts both players' moves) |
 | Who gets consolation | the loser on every decisive result except `timeout`; both players on `draw`; nobody on `timeout` |
@@ -769,32 +979,144 @@ Behavior:
   wagered match. `DailyGame::win_payout` stays display-only and equal to
   the template, same rule for `consolation_min_moves`.
 
+Status: part 1 shipped 2026-08-27 (migration 161, `DailyService::pay_winner`,
+`ChipService::credit_per_event_pair_day_reward_template`). Part 2, the wager,
+is still open. Deviations from the design above, each deliberate:
+- **The pair-day cap is per opponent per game**, not per opponent. The
+  `pair_day` claim rides `grant_multi` under the template's `game`
+  (`daily_chess`, `daily_battleship`, ...) like every claim row, so chess and
+  battleship against the same person on the same posting day both pay.
+  Decided 2026-08-27 in review: friends who play several games together are
+  never touched, and a colluding pair is bounded at one paid win per roster
+  game per direction per posting day (about 3,300 chips each way, and only
+  after playing all eight games). If Top Chips ever looks wrong, the
+  per-account daily quota is the next step, not a tighter pair key.
+- **A win pays only with at least 5 half-moves played**
+  (`DAILY_WIN_MIN_MOVES`; both players' moves count, a resign is not a move,
+  a timeout counts what was played). Not in the design. It stops the
+  zero-move claim-and-resign and nothing more: a move count sets a rate, not
+  a bound, since there is no minimum time per move. The pair-day cap is the
+  bound.
+- **The consolation is dropped, not built.** 100 chips for showing up could
+  not be paid without reopening the faucet the cap just closed, and the wager
+  is the real finish-your-games lever. The rows for it in the table above
+  stay as the record of what was considered.
+- The credit is awaited inside `finish_events` rather than spawned, so the
+  `MatchFinished` event and the banner say what the chips did
+  (`DailyWinPayout`: paid / unplayed / pair_day_capped / failed), and the same
+  outcome is stored in `daily_matches.win_payout` for the lingering result
+  row, so an offline winner learns why the chips did or did not come. A
+  failed credit never un-finishes a match.
+
 Checklist:
-- [ ] Pair-day cap on the win payout, with a test: two decisive matches
+- [x] Pair-day cap on the win payout, with a test: two decisive matches
       against the same opponent on one UTC day pay once; the next day pays
       again; a different opponent the same day pays.
-- [ ] Consolation: loser at the threshold is paid, one move short is not,
-      draw pays both, timeout pays neither, and the pair-day cap covers it.
+- [x] Test pinning the per-game scope: chess and chess960 against the
+      same opponent on one posting day both pay
+      (`pair_day_cap_is_scoped_to_the_game`).
+- [x] Consolation: dropped, see the status block above.
 - [ ] Wager: hold on post, match on claim, short balance fails the right
       step, settle on every finish path, refund on cancel and draw, timeout
       pays the pot, retry of any path is a no-op. Whole-ledger assertions:
       the sum of the four wager moves for a match equals minus the burn.
-- [ ] `daily/CONTEXT.md` sections 1, 3, 6, 8 and the chips context updated;
-      help copy for the stake row; roster protocol ("Adding a game to the
-      roster") gains the `consolation_min_moves` arm.
+- [ ] `daily/CONTEXT.md` sections 1, 3, 6, 8 and the chips context updated
+      (done for part 1); help copy for the stake row waits on the wager. The
+      `consolation_min_moves` roster arm is gone with the consolation.
 
 Out of scope: spectator side bets (the arena, GAME.md phase 4), tournaments,
 draw offers, house-table stakes, an entry fee on unwagered matches, elapsed
 time as a gate (no claim timestamp exists; add one only if a game ever
 needs it).
 
+## Phase 8: the round
+
+Goal: a sink whose whole product is one line in #lounge, "mira bought the
+house a round". The chips are burned; what the room gets is a story and a
+free drink each.
+
+Behavior:
+- Tables (migration 164): `drink_rounds(id uuidv7, buyer_user_id,
+  price_per_patron, created)` and `drink_credits(id uuidv7, round_id,
+  user_id, expires_at, cashed_at, created)`, with a partial unique index on
+  `(user_id) WHERE cashed_at IS NULL`. No stored total on the round: the
+  credits are the witness of how many it bought and the ledger row is the
+  record of what it cost, exactly like the pot's tickets.
+- **The trigger is a literal phrase, not a model decision.** `ROUND_PHRASES`
+  in `late-core/src/models/drink_round.rs` is the closed list ("round for
+  everyone", "round for all", "round for the house", ...), matched
+  case-insensitively on word boundaries. This is the only bartender action
+  that spends more than one drink's worth, and the price is the size of the
+  room, so the phrase itself is the confirmation. An order is a statement:
+  a phrase whose sentence ends in `?` ("how much is a round for everyone?")
+  or sits inside backticks is a question about the words, not the words,
+  and goes to the model to be answered. @bartender never decides to buy
+  one; the prompt tells him to hand out the words instead.
+- **`chat/slur.rs` never scrambles the phrase.** Drunk text is stored, not
+  rendered, so a wasted patron's "round for everyone" would otherwise reach
+  the matcher as "ronud for eevryone", breaking the feature for exactly the
+  people most likely to use it. Both the guard and the matcher read the one
+  list, so they cannot drift. The hiccup is kept out of it too.
+- **Price** `ROUND_PRICE_PER_PATRON` (100) for every credit that actually
+  landed, `ChipMove::RoundPurchase`, floor-guarded, burned whole with no
+  credit row anywhere (the crown's shape), excluded from Top Chips like
+  every other vanity burn. Presence is the in-process `active_users` roster
+  minus the buyer and the bots: single-replica, and deliberately so (see the
+  status block).
+- **Only the buyer is poured into.** "Round on me" includes me: the buyer
+  drinks theirs on the spot, `ROUND_DRINK_POINTS` in the same transaction as
+  the charge, riding on the round's price rather than adding a head to it. A
+  drink makes a patron type drunk in public, so everyone else gets a credit,
+  not a drink; it is cashed only when they walk up and order from @bartender
+  themselves. One open credit per patron
+  (across every round, so a second round moments later reaches nobody and is
+  refused uncharged), `ROUND_CREDIT_TTL_HOURS` (24) to claim it, and cashing
+  is one guarded UPDATE so it can only ever be drunk once.
+- **A cashed drink pours `ROUND_DRINK_POINTS` (300)** whatever the bartender
+  invented to call it: three times what the buyer paid, and exactly the
+  buzzed threshold, so a sober room that drinks the round visibly moves a
+  level for about an hour. `lifetime_spent` does not move; the chips are on
+  the buyer's ledger row.
+- Refusals (`RoundRefusal`, all uncharged): nobody else at the bar, everyone
+  already holding one, and the chip floor. Each gets a scripted line from
+  @bartender, behind the mention ladder since they are free (a settled round
+  never is), as does the purchase itself: this is the one line that has to
+  quote the number the patron was actually charged, and it must land the
+  moment the chips move rather than after a model round trip.
+
+Status:
+- **Presence is in-process, not a DB query**, unlike the original sketch.
+  There is no presence table in this repo: `users.last_seen` is written only
+  at connect and `user_online_time` is a cumulative total. Building one was
+  more work than the feature, so the round reads `active_users` like the
+  clubhouse headcount does. On a second replica a round would only reach the
+  buyer's own pod; the credits it grants are DB rows and cash from anywhere.
+  Revisit with the rest of the multi-replica work (root `CONTEXT.md`).
+- **No `round` action in the bartender's JSON schema**, unlike the sketch.
+  The phrase gate replaced it, which also means a round costs no model call
+  and cannot be throttled by the mention ladder.
+
+Acceptance:
+- [x] Phrase gate: every listed phrase fires, "turn around for all of us"
+      does not, and the spans land on the phrase itself.
+- [x] The order survives every drunk level at 200 seeds, verbatim, while
+      the words around it still take their beating.
+- [x] One open credit per patron; an expired one is re-used rather than
+      blocking the slot forever.
+- [x] A credit is drunk exactly once, and an expired one cannot be drunk.
+- [x] The buyer pays for the credits that landed, not the heads counted;
+      an unaffordable round leaves no credits and no charge.
+- [x] A cashed drink costs the drinker nothing and lands them at buzzed.
+- [x] Ticker line, metrics (granted vs cashed), help copy, and the
+      `chat/CONTEXT.md` section.
+
+Out of scope: a DB presence table, rounds for one named person (that is
+`/gift`), a round in the Clubhouse tavern without @bartender, extending or
+gifting a credit, and any per-buyer cooldown (the one-credit rule is the
+throttle).
+
 ## Parked
 
-- **The round** ("mira bought the house a round"): price 100 x patrons
-  present (a DB presence query, never lobby state), DB-backed
-  `drink_credits` as consent (one open credit per user, 24h expiry, cashed
-  by ordering from @bartender), `ChipMove::RoundPurchase`, a `round`
-  action in the bartender schema. About the size of gild. After Phase 5.
 - **Sealed daily bids for the marquee line**: the pot's tables with `max`
   instead of `random`. After the pot.
 - **Split the shop snapshot refresh** (only if chip notifies ever get
@@ -811,9 +1133,8 @@ Owner notes to pick up in a later spitball, kept here so they are not lost:
   eat what they pay). Still open there: Asterion's daily 4,000.
 - ~~Lobby game economics.~~ Phase 7 above (pair-day cap, consolation,
   wagers). Still open in the Lobby: spectator side bets, tournaments.
-- ~~A payout for the loser, gated on effort.~~ Phase 7 above: 100 chips at
-  a per-game move threshold, never on timeout, capped per opponent per
-  day.
+- ~~A payout for the loser, gated on effort.~~ Was Phase 7's consolation;
+  dropped 2026-08-27 (see the Phase 7 status block).
 
 ## Dropped
 

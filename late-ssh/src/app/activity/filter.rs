@@ -29,6 +29,9 @@ pub fn lounge_includes(event: &ActivityEvent) -> bool {
     match &event.kind {
         // Presence story: someone showed up.
         ActivityKind::UserJoined => true,
+        // One person's generosity, in front of the room. The whole point of
+        // the mechanic is this line.
+        ActivityKind::RoundBought { .. } => true,
         // Invitations: an open seat someone can still claim.
         ActivityKind::SatDown { .. } => true,
         // Door-game stories: entering a world, felling its bosses.
@@ -115,6 +118,9 @@ pub fn lounge_includes(event: &ActivityEvent) -> bool {
         // are bought to be read next to the name in every message.
         ActivityKind::BadgeRented { .. } => true,
         ActivityKind::TitleApplied { .. } => true,
+        // The dearest thing anyone buys, and it buys nothing but being seen
+        // buying it. Once per rung per account forever, so it cannot repeat.
+        ActivityKind::BurnMilestone { .. } => true,
         // A room paying for something someone said, three times over. Rare by
         // construction (once per message, at the threshold gild only) and the
         // line points at a room worth reading.
@@ -123,6 +129,10 @@ pub fn lounge_includes(event: &ActivityEvent) -> bool {
         // by price (each take is 1.5x the last), so this is the story the
         // crown exists to ship.
         ActivityKind::CrownTaken { .. } => true,
+        // The pot's one line: once a week when it draws. The size itself
+        // rides the status HUD all week, so there is nothing to nudge about
+        // before that.
+        ActivityKind::PotDrawn { .. } => true,
         // Publishing on cyberspace: our user's own action, rare by their API
         // rate limits (15 entries/day), and the funnel that advertises the
         // integration ("wait, you can post to cyberspace from here?").
@@ -177,7 +187,29 @@ pub fn lounge_headline(event: &ActivityEvent) -> Option<String> {
                 ),
             })
         }
-        ActivityKind::UserJoined
+        // Once a day, and the one person it matters most to is the one most
+        // likely to have been offline for it. A ticker line is gone by the
+        // time they reconnect; a headline is a row in #lounge history they
+        // can still read.
+        ActivityKind::PotDrawn {
+            payout,
+            winner_tickets,
+            total_tickets,
+            ..
+        } => {
+            let winner = &event.username;
+            Some(format!(
+                "\u{1F3B0} {winner} won the pot: {} chips on {} of {} tickets.",
+                thousands(*payout),
+                thousands(*winner_tickets),
+                thousands(*total_tickets)
+            ))
+        }
+        // No headline: @bartender already says it out loud in the room where
+        // it was bought, and everyone it reached is online by definition, so a
+        // #lounge row would be the third telling of one drink.
+        ActivityKind::RoundBought { .. }
+        | ActivityKind::UserJoined
         | ActivityKind::GameStarted { .. }
         | ActivityKind::GameWon { .. }
         | ActivityKind::GameScored { .. }
@@ -190,6 +222,7 @@ pub fn lounge_headline(event: &ActivityEvent) -> Option<String> {
         | ActivityKind::UsernameEffectApplied { .. }
         | ActivityKind::BadgeRented { .. }
         | ActivityKind::TitleApplied { .. }
+        | ActivityKind::BurnMilestone { .. }
         | ActivityKind::MessageGilded { .. }
         | ActivityKind::CyberspacePosted { .. }
         | ActivityKind::WentLive { .. }

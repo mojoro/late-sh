@@ -113,3 +113,24 @@ fn lounge_headlines_only_the_crown_with_both_names_and_the_next_price() {
     assert!(lounge_includes(&joined));
     assert_eq!(lounge_headline(&joined), None);
 }
+
+/// The pot's one line. The draw names the winner and the odds and also
+/// headlines (a real #lounge row, so a winner who was offline reads it on
+/// return).
+#[test]
+fn lounge_includes_the_pots_draw_line() {
+    let pot_id = Uuid::nil();
+    let drawn = ActivityEvent::pot_drawn(Uuid::nil(), "mira", pot_id, 67_360, 3, 312);
+    assert!(lounge_includes(&drawn));
+    assert_eq!(
+        drawn.action,
+        "won 67,360 chips from the pot on 3 of 312 tickets"
+    );
+    assert_eq!(
+        lounge_headline(&drawn),
+        Some("\u{1F3B0} mira won the pot: 67,360 chips on 3 of 312 tickets.".to_string())
+    );
+
+    // Feed bodies never carry an @.
+    assert!(!drawn.action.contains('@'));
+}

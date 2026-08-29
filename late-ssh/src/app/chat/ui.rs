@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use late_core::models::article::NEWS_SHARE_REWARD_CHIPS;
 use late_core::models::chat_message_gild::ChatMessageGildSummary;
 use late_core::models::chat_message_reaction::ChatMessageReactionSummary;
 use late_core::models::chat_poll::{ActiveChatPoll, ChatPollOptionSummary};
@@ -1321,6 +1322,9 @@ pub(crate) enum HeaderTarget {
     /// The currently equipped chat flag. Resolves to the Hub Shop opened
     /// on the Flags sub-store.
     StoreFlag,
+    /// The dearest burn milestone this author owns. Resolves to the Hub Shop
+    /// opened on the Ultimates sub-store, where the ladder is sold.
+    StoreMilestone,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1482,6 +1486,10 @@ fn push_new_messages_divider(
     row_kind.push(RowKindLite::Blank);
 }
 
+/// Whether the `new messages` divider goes above `message`: the first
+/// message from someone else since this session's human went quiet. Your own
+/// messages never trip it, and posting one clears the line outright, so the
+/// divider can only ever sit above somebody else's words.
 fn is_unread_boundary_message(
     marker: Option<DateTime<Utc>>,
     message: &ChatMessage,
@@ -1637,6 +1645,7 @@ fn ensure_chat_rows_cache(
             author: &author,
             crown: flair.is_some_and(|flair| flair.crown),
             title: flair.and_then(|flair| flair.title.as_deref()),
+            milestone: flair.and_then(|flair| flair.milestone.as_deref()),
             special_badges: special_list,
             chat_badges: &chat_badge_refs,
             bonsai_glyph: bonsai_opt,
@@ -2391,6 +2400,7 @@ fn build_author_prefix_and_segments(
         author,
         crown: false,
         title: None,
+        milestone: None,
         special_badges,
         chat_badges: &chat_badges,
         bonsai_glyph,
@@ -2409,6 +2419,10 @@ struct AuthorPrefixInput<'a> {
     /// Whether this author currently wears the crown.
     crown: bool,
     title: Option<&'a str>,
+    /// The dearest burn milestone this author owns. A badge, not a mark on
+    /// the name, so it joins the badge stack rather than trailing the
+    /// username the way the crown and title do.
+    milestone: Option<&'a str>,
     special_badges: &'a [&'a str],
     chat_badges: &'a [(HeaderTarget, &'a str)],
     bonsai_glyph: Option<&'a str>,
@@ -2436,6 +2450,7 @@ fn build_author_prefix_and_segments_with_chat_badges(input: AuthorPrefixInput<'_
         author,
         crown,
         title,
+        milestone,
         special_badges,
         chat_badges,
         bonsai_glyph,
@@ -2511,6 +2526,7 @@ fn build_author_prefix_and_segments_with_chat_badges(input: AuthorPrefixInput<'_
     let mut typed_badges: Vec<(HeaderTarget, &str)> = Vec::with_capacity(
         special_badges.len()
             + chat_badges.len()
+            + milestone.is_some() as usize
             + bonsai_glyph.is_some() as usize
             + profile_award_badges.is_some() as usize
             + presence_badges.len(),
@@ -2530,6 +2546,12 @@ fn build_author_prefix_and_segments_with_chat_badges(input: AuthorPrefixInput<'_
     }
     for (target, s) in chat_badges.iter().copied().filter(|(_, s)| !s.is_empty()) {
         typed_badges.push((target, s));
+    }
+    // On top of the rentals, never in place of one: a rented badge and flag
+    // cost a hundred chips each and a milestone costs fifty thousand, so
+    // nothing a player rents may hide one.
+    if let Some(s) = milestone.filter(|s| !s.is_empty()) {
+        typed_badges.push((HeaderTarget::StoreMilestone, s));
     }
     for s in presence_badges.iter().copied().filter(|s| !s.is_empty()) {
         typed_badges.push((HeaderTarget::Profile, s));
@@ -2733,7 +2755,9 @@ pub struct ChatRenderInput<'a> {
     pub message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
     pub message_gilds: &'a HashMap<Uuid, ChatMessageGildSummary>,
     pub inline_images: &'a HashMap<Uuid, InlineImagePreview>,
-    pub room_unread_markers: &'a HashMap<Uuid, Option<DateTime<Utc>>>,
+    /// This session's AFK line per room; the `new messages` divider
+    /// draws before the first message from someone else past it.
+    pub afk_lines: &'a HashMap<Uuid, DateTime<Utc>>,
     pub unread_counts: &'a HashMap<Uuid, i64>,
     pub room_last_message_at: &'a HashMap<Uuid, Option<DateTime<Utc>>>,
     pub favorite_room_ids: &'a [Uuid],
@@ -4857,7 +4881,7 @@ fn draw_selected_content(
                     message_reactions: view.message_reactions,
                     message_gilds: view.message_gilds,
                     inline_images: view.inline_images,
-                    unread_marker: view.room_unread_markers.get(&room.id).copied().flatten(),
+                    unread_marker: view.afk_lines.get(&room.id).copied(),
                     drunk_levels: view.drunk_levels,
                     name_flair: view.name_flair,
                     peer_pomodoros: view.peer_pomodoros,
@@ -4922,8 +4946,9 @@ fn draw_selected_content(
             .block(hint_block);
             frame.render_widget(hint_text, composer_area);
         } else {
+            let rss_title = format!(" RSS · a share pays {NEWS_SHARE_REWARD_CHIPS} chips ");
             let hint_block = Block::default()
-                .title(" RSS ")
+                .title(rss_title.as_str())
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::BORDER()));
             let hint_text = Paragraph::new(Line::from(Span::styled(
@@ -5071,7 +5096,9 @@ fn draw_selected_content(
                 )
             } else {
                 (
-                    " Paste URL (Enter submit, Esc cancel) ".to_string(),
+                    format!(
+                        " Paste URL · Enter submit, Esc cancel · +{NEWS_SHARE_REWARD_CHIPS} chips "
+                    ),
                     Style::default().fg(theme::BORDER_ACTIVE()),
                 )
             };
@@ -5084,8 +5111,9 @@ fn draw_selected_content(
             let text_area = horizontal_inset(news_inner, 1);
             frame.render_widget(view.news_composer, text_area);
         } else {
+            let share_title = format!(" Share URL · +{NEWS_SHARE_REWARD_CHIPS} chips ");
             let hint_block = Block::default()
-                .title(" Share URL ")
+                .title(share_title.as_str())
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::BORDER()));
             let hint_text = Paragraph::new(Line::from(Span::styled(

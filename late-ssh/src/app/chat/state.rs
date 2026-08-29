@@ -34,7 +34,9 @@ use uuid::Uuid;
 use late_core::models::chat_message::HistoryDirection;
 
 use crate::app::ai::ladder::MentionLadders;
-use crate::app::ai::summary::{SummaryEvent, SummaryOutcome, SummaryService, SummaryWindow};
+use crate::app::ai::summary::{
+    SummaryBasis, SummaryEvent, SummaryOutcome, SummaryService, SummaryWindow,
+};
 use crate::app::ai::translate::{TranslationEvent, TranslationOutcome, TranslationService};
 use crate::app::common::overlay::Overlay;
 use crate::app::common::theme;
@@ -81,6 +83,18 @@ const TERMINAL_IMAGE_MAX_COLS: u32 = 200;
 const TERMINAL_IMAGE_MAX_ROWS: u32 = 60;
 const CLIPBOARD_IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_CURSOR_FLUSH_DELAY: Duration = Duration::from_secs(2);
+
+/// How long this session's keyboard has to stay quiet before the room on
+/// screen gets an AFK line.
+///
+/// This is a threshold for *absence*, not for reading: reading produces no
+/// input at all, so a lurker who sits silent this long collects a line they
+/// did not need. That is the deliberate direction to be wrong in. A line
+/// nobody wanted costs one glance; the failure it replaced, treating a
+/// parked terminal as a reader, silently swallowed the whole day someone
+/// missed. Long enough that a coffee run does not trip it, short enough
+/// that a real absence is caught before the conversation moves on.
+const AFK_LINE_IDLE: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) type InlineImagePreview = crate::app::files::inline_image::InlineImagePreview;
 pub(crate) type InlineImageRenderSettings =
@@ -313,6 +327,46 @@ fn parse_crown_command(body: &str) -> Option<Option<CrownCommand>> {
         "take" => Some(CrownCommand::Take),
         _ => None,
     })
+}
+
+/// The pot, requested from the composer. `App` owns the pot service, so the
+/// composer just records the intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PotCommand {
+    /// `/pot`: size, tickets, your holding, and time to the draw.
+    Status,
+    /// `/pot buy N`: buy N tickets at the flat ticket price.
+    Buy { count: i64 },
+}
+
+/// `Some(Some(command))` on `/pot` or a well-formed `/pot buy N`,
+/// `Some(None)` on anything else after `/pot` (usage banner), `None` when the
+/// line is not a pot command at all.
+///
+/// The count is parsed here rather than in the service: a boundary that only
+/// admits 1..=(the daily cap) is what lets everything downstream trust the
+/// number; whether today still has room is the service's call.
+fn parse_pot_command(body: &str) -> Option<Option<PotCommand>> {
+    use late_core::models::pot::POT_MAX_TICKETS_PER_DAY;
+    let rest = body.trim().strip_prefix("/pot")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Some(Some(PotCommand::Status));
+    }
+    let Some(count) = rest.strip_prefix("buy ") else {
+        return Some(None);
+    };
+    Some(
+        count
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|count| (1..=POT_MAX_TICKETS_PER_DAY).contains(count))
+            .map(|count| PotCommand::Buy { count }),
+    )
 }
 
 /// An aquarium control requested from the composer (`/aquarium`,
@@ -686,7 +740,33 @@ pub struct ChatState {
     image_modal_capacity: Option<(u16, u16)>,
     pending_reaction_owners_message_id: Option<Uuid>,
     pub(crate) unread_counts: HashMap<Uuid, i64>,
-    pub(crate) room_unread_markers: HashMap<Uuid, Option<DateTime<Utc>>>,
+    /// The AFK line per room: the instant this session's human went quiet
+    /// while that room was on screen. The `new messages` divider draws
+    /// against it and `/history` opens there. It is one of two marks, and
+    /// the other one, [`ChatState::device_left_at`], is what `/summary`
+    /// reads; they never feed each other.
+    ///
+    /// Deliberately session-local and never written to the DB. "Did the
+    /// person at this terminal step away" is a fact about this terminal;
+    /// your phone being idle says nothing about your desktop.
+    ///
+    /// Placed by [`ChatState::sync_afk_line`], removed only when a message
+    /// you wrote lands in the room. Not by coming back and touching a key
+    /// (the line exists to show you where to start reading, and clearing it
+    /// on the keystroke that returns you destroys it exactly when it is
+    /// wanted), and not by `/summary` or `/history`, which do not read it
+    /// as a catch-up cursor at all in the first case and only look in the
+    /// second.
+    pub(crate) afk_lines: HashMap<Uuid, DateTime<Utc>>,
+    /// The other mark: when you last left the app on this device, the
+    /// moment the keyboard went quiet before the previous session on this
+    /// SSH key ended (`user_ssh_keys.left_at`, taken once at boot). A bare
+    /// `/summary` always reads from here, whatever the AFK line says: the
+    /// question it answers is "what happened since I was last here", and
+    /// "here" is this device, not this room. Fixed for the session, so
+    /// asking twice reads the same stretch twice; `None` for a keyless
+    /// session or a device with no mark yet.
+    device_left_at: Option<DateTime<Utc>>,
     pending_read_rooms: HashSet<Uuid>,
     pending_read_flush: PendingReadCursorFlush,
     /// Message ids whose mentions of this user were already reported as
@@ -769,6 +849,9 @@ pub struct ChatState {
     /// Mirrors of the profile's translation settings, synced by `App::tick`.
     translate_to: TranslateLang,
     auto_translate: bool,
+    /// The viewer's account timezone, synced by `App::tick`. `None` (unset or
+    /// unparseable) means every absolute time this pane writes stays UTC.
+    viewer_tz: Option<chrono_tz::Tz>,
     pub(crate) selected_message_id: Option<Uuid>,
     /// Row-level viewport offset inside a selected message that wraps taller
     /// than the chat pane; see [`SelectionScroll`]. Reset whenever the
@@ -855,6 +938,7 @@ pub struct ChatState {
     /// Set by /golive; consumed by `App` (which owns the stream service).
     requested_golive: Option<GoLiveCommand>,
     requested_crown: Option<CrownCommand>,
+    requested_pot: Option<PotCommand>,
     /// Set by /watch @user; consumed by `App`.
     requested_watch: Option<String>,
     /// A stream room this session just opened; consumed by `App`, which
@@ -976,6 +1060,10 @@ pub(crate) struct ChatSession {
     pub user_id: Uuid,
     pub username: String,
     pub permissions: Permissions,
+    /// When you last left the app on this device (`user_ssh_keys.left_at`,
+    /// taken once at boot); `None` for a keyless session or a device with
+    /// no mark yet. See [`ChatState::device_left_at`].
+    pub device_left_at: Option<DateTime<Utc>>,
 }
 
 pub(crate) struct ChatServices {
@@ -1009,6 +1097,7 @@ impl ChatState {
             user_id,
             username,
             permissions,
+            device_left_at,
         } = session;
         let ChatServices {
             chat: service,
@@ -1066,7 +1155,8 @@ impl ChatState {
             image_modal_capacity: None,
             pending_reaction_owners_message_id: None,
             unread_counts: HashMap::new(),
-            room_unread_markers: HashMap::new(),
+            afk_lines: HashMap::new(),
+            device_left_at,
             pending_read_rooms: HashSet::new(),
             pending_read_flush: PendingReadCursorFlush::default(),
             mention_reads_sent: HashSet::new(),
@@ -1106,6 +1196,7 @@ impl ChatState {
             translation_cache_checked: HashSet::new(),
             translate_to: TranslateLang::En,
             auto_translate: false,
+            viewer_tz: None,
             selected_message_id: None,
             selection_scroll: SelectionScroll::default(),
             pending_delete_message_id: None,
@@ -1159,6 +1250,7 @@ impl ChatState {
             requested_voice_command: None,
             requested_golive: None,
             requested_crown: None,
+            requested_pot: None,
             requested_watch: None,
             opened_stream_room: None,
             requested_aquarium_command: None,
@@ -1299,6 +1391,44 @@ impl ChatState {
         self.pending_read_flush.queue(room_id, Instant::now());
     }
 
+    /// Place the AFK line for the room on screen once this session's
+    /// keyboard has been quiet for [`AFK_LINE_IDLE`]. `idle` is how long ago
+    /// the last input landed, mirrored from `App` the same way `viewer_tz`
+    /// is. Reports whether the line moved, since that is render-visible.
+    ///
+    /// Only the visible room can collect a line: a room you are not looking
+    /// at was never being attended, and its rail badge already says what is
+    /// waiting. A room that already holds a line keeps the one it has, so
+    /// the line marks when you went quiet and does not slide forward while
+    /// you stay away.
+    pub(crate) fn sync_afk_line(&mut self, idle: Duration) -> bool {
+        if idle < AFK_LINE_IDLE {
+            return false;
+        }
+        let Some(room_id) = self.visible_room_id else {
+            return false;
+        };
+        if self.afk_lines.contains_key(&room_id) {
+            return false;
+        }
+        let Ok(idle) = chrono::Duration::from_std(idle) else {
+            return false;
+        };
+        self.afk_lines.insert(room_id, Utc::now() - idle);
+        self.bump_room_version(room_id);
+        true
+    }
+
+    /// Drop the room's AFK line: this reader is in the conversation again.
+    ///
+    /// One caller, and it is an act the reader performed rather than a state
+    /// we inferred: a message of theirs landing in the room.
+    fn clear_afk_line(&mut self, room_id: Uuid) {
+        if self.afk_lines.remove(&room_id).is_some() {
+            self.bump_room_version(room_id);
+        }
+    }
+
     /// Remember the DM being read so the promoted unread-DMs group can hold it
     /// in place. Reading is what zeroes the unread count, so this runs before
     /// the count is cleared.
@@ -1347,6 +1477,11 @@ impl ChatState {
     /// Sync the profile's translation settings into this session. Called from
     /// `App::tick`; a target change drops every per-message translation state
     /// (it all describes the old language) and invalidates row caches.
+    /// Mirror the account timezone the summary overlay dates its window in.
+    pub(crate) fn set_viewer_tz(&mut self, timezone: Option<chrono_tz::Tz>) {
+        self.viewer_tz = timezone;
+    }
+
     pub fn set_translate_settings(&mut self, target: TranslateLang, auto: bool) -> bool {
         let mut changed = false;
         if self.translate_to != target {
@@ -1568,13 +1703,35 @@ impl ChatState {
                     text,
                     message_count,
                     since,
+                    basis,
+                    capped,
                     truncated,
                 } => {
                     let plural = if message_count == 1 { "" } else { "s" };
-                    let mut head = format!(
-                        "{message_count} message{plural} since {}",
-                        since.format("%b %d %H:%M UTC")
-                    );
+                    let stamp = crate::app::common::time::instant_for_viewer(since, self.viewer_tz);
+                    // Every arm names where the window came from, because
+                    // "since you left" and "the last 24h" are different
+                    // claims and the reader has to be able to tell which
+                    // one they got. A capped window says so rather than
+                    // presenting the cap as the moment they left.
+                    let mut head = match basis {
+                        SummaryBasis::LeftApp => {
+                            format!("{message_count} message{plural} since you left · {stamp}")
+                        }
+                        SummaryBasis::Default => format!(
+                            "{message_count} message{plural} since {stamp} · the last {}h",
+                            crate::app::ai::summary::SUMMARY_DEFAULT_WINDOW_HOURS
+                        ),
+                        SummaryBasis::Explicit => {
+                            format!("{message_count} message{plural} since {stamp}")
+                        }
+                    };
+                    if capped {
+                        head.push_str(&format!(
+                            " · capped at {}h",
+                            crate::app::ai::summary::SUMMARY_MAX_WINDOW_HOURS
+                        ));
+                    }
                     if truncated {
                         head.push_str(" · older messages past the cap left out");
                     }
@@ -1592,8 +1749,12 @@ impl ChatState {
                         None => self.overlay = Some(overlay),
                     }
                 }
-                SummaryOutcome::Empty => {
-                    banner = Some(Banner::info("Nothing new to summarize"));
+                SummaryOutcome::Empty { basis } => {
+                    banner = Some(Banner::info(match basis {
+                        SummaryBasis::LeftApp => "Nothing new since you left",
+                        SummaryBasis::Default => "Nothing said in the last 24h",
+                        SummaryBasis::Explicit => "Nothing said in that window",
+                    }));
                 }
                 SummaryOutcome::InFlight => {
                     banner = Some(Banner::info("Summary already running"));
@@ -1843,6 +2004,10 @@ impl ChatState {
 
     pub(crate) fn take_requested_crown(&mut self) -> Option<CrownCommand> {
         self.requested_crown.take()
+    }
+
+    pub(crate) fn take_requested_pot(&mut self) -> Option<PotCommand> {
+        self.requested_pot.take()
     }
 
     pub(crate) fn take_requested_watch(&mut self) -> Option<String> {
@@ -2352,12 +2517,15 @@ impl ChatState {
         );
     }
 
-    /// The unread cutoff the history modal's divider draws against: the
-    /// pre-mark `last_read_at` captured by the room's tail load. A missing
-    /// marker (caught up) or a never-read room (inner `None`) yields no
-    /// divider, mirroring the live tail.
+    /// The unread cutoff the history modal's divider draws against: this
+    /// session's AFK line for the room. No line (you never stepped away, or
+    /// you have caught up since) yields no divider, mirroring the live tail.
+    ///
+    /// `/history` only reads the line, never clears it: opening scrollback
+    /// is how you go and look at the backlog, not proof you got through it,
+    /// and the anchor should still be there when you close the modal.
     fn history_unread_cutoff(&self, room_id: Uuid) -> Option<DateTime<Utc>> {
-        self.room_unread_markers.get(&room_id).copied().flatten()
+        self.afk_lines.get(&room_id).copied()
     }
 
     /// Title for the history modal. A public-room mention can point at a room
@@ -3297,12 +3465,11 @@ impl ChatState {
             if room.visibility != "public" {
                 return Some(Banner::error("Summaries cover public rooms only"));
             }
-            let now = Utc::now();
             let window = match parse_summary_arg(rest) {
-                SummaryArg::CatchUp => SummaryWindow::SinceRead(summary_since(
-                    self.room_unread_markers.get(&room_id),
-                    now,
-                )),
+                // Always the device mark, never the room's AFK line: the
+                // catch-up answers "what happened since I was last here",
+                // and here is this device. The service only clamps it.
+                SummaryArg::CatchUp => catch_up_window(self.device_left_at),
                 SummaryArg::Window(back) => SummaryWindow::Explicit(back),
                 SummaryArg::Unparseable => {
                     return Some(Banner::error("Use /summary, or a window like /summary 6h"));
@@ -3325,6 +3492,8 @@ impl ChatState {
                 window,
                 exclude_user_ids,
             );
+            // The line stays: the summary says what is below it, it does
+            // not move where it is. Only speaking in the room does that.
             return Some(Banner::info("Summarizing…"));
         }
 
@@ -3369,6 +3538,18 @@ impl ChatState {
                 return Some(Banner::error("Usage: /crown, or /crown take"));
             };
             self.requested_crown = Some(command);
+            return None;
+        }
+
+        if let Some(parsed) = parse_pot_command(&body) {
+            self.clear_composer_after_submit();
+            let Some(command) = parsed else {
+                return Some(Banner::error(&format!(
+                    "Usage: /pot, or /pot buy N (1 to {})",
+                    late_core::models::pot::POT_MAX_TICKETS_PER_DAY
+                )));
+            };
+            self.requested_pot = Some(command);
             return None;
         }
 
@@ -5482,7 +5663,6 @@ impl ChatState {
                 ChatEvent::RoomTailLoaded {
                     user_id,
                     room_id,
-                    last_read_at,
                     messages,
                     message_reactions,
                     message_gilds,
@@ -5513,14 +5693,6 @@ impl ChatState {
                         extend_changed(&mut self.profile_award_badges, profile_award_badges);
                     if context_changed {
                         self.context_epoch += 1;
-                    }
-                    if messages.iter().any(|message| {
-                        last_read_at.is_none_or(|read_at| message.created > read_at)
-                            && message.user_id != self.user_id
-                    }) {
-                        self.room_unread_markers.insert(room_id, last_read_at);
-                    } else {
-                        self.room_unread_markers.remove(&room_id);
                     }
                     self.merge_room_tail(room_id, messages);
                     let mut reactions_changed = false;
@@ -6170,6 +6342,16 @@ impl ChatState {
                 at: created,
             });
             return;
+        }
+
+        // Speaking in a room clears its AFK line: you are in the conversation
+        // now, whatever the keyboard was doing before. Done on the message
+        // landing rather than at each of the several submit paths (`/me`,
+        // `/roll`, `/cup`, a plain line) so there is one place to look, and
+        // it is the authoritative one: the line goes when the message that
+        // ends the silence actually exists.
+        if message.user_id == self.user_id {
+            self.clear_afk_line(room_id);
         }
 
         let is_viewing_room = Some(room_id) == self.visible_room_id;
@@ -7916,21 +8098,13 @@ fn short_user_id(user_id: Uuid) -> String {
     id[..id.len().min(8)].to_string()
 }
 
-/// The `/summary` window start this session asks for: the pre-mark unread
-/// marker when one is set (the server cursor advanced the moment the room
-/// opened), the max window for a never-read room with unread waiting
-/// (inner `None`), and `now` when caught up (no entry).
-///
-/// Only the marker lives here. Both window bounds are the summary
-/// service's (`window_start`), so a start inside the minimum window widens
-/// to it: `now` is "no reason to read further back", not "read nothing".
-fn summary_since(marker: Option<&Option<DateTime<Utc>>>, now: DateTime<Utc>) -> DateTime<Utc> {
-    match marker {
-        Some(Some(marker)) => *marker,
-        Some(None) => {
-            now - chrono::Duration::hours(crate::app::ai::summary::SUMMARY_MAX_WINDOW_HOURS)
-        }
-        None => now,
+/// The window a bare `/summary` opens: from when you last left the app on
+/// this device, or the default when the device has no mark. The room's AFK
+/// line is deliberately not an input; see [`ChatState::device_left_at`].
+fn catch_up_window(device_left_at: Option<DateTime<Utc>>) -> SummaryWindow {
+    match device_left_at {
+        Some(left_at) => SummaryWindow::SinceLeftApp(left_at),
+        None => SummaryWindow::Default,
     }
 }
 
@@ -7939,7 +8113,7 @@ fn summary_since(marker: Option<&Option<DateTime<Utc>>>, now: DateTime<Utc>) -> 
 /// silently become the default window.
 #[derive(Debug, PartialEq, Eq)]
 enum SummaryArg {
-    /// Bare `/summary`: catch up from the read marker.
+    /// Bare `/summary`: catch up from when you last left the app here.
     CatchUp,
     Window(chrono::Duration),
     /// Not a `<count><unit>` duration at all.

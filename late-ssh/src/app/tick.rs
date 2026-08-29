@@ -235,6 +235,7 @@ impl App {
         changed |= self.drain_voice_join_results();
         changed |= self.tick_stream();
         changed |= self.tick_crown();
+        changed |= self.tick_pot();
         // News state is ticked inside chat.tick()
         let profile_tick = self.profile_state.tick();
         changed |= profile_tick.changed;
@@ -244,6 +245,14 @@ impl App {
         }
         self.chat
             .set_favorite_room_ids(self.profile_state.profile().favorite_room_ids.clone());
+        self.chat
+            .set_viewer_tz(crate::app::profile::svc::parse_account_tz(
+                self.profile_state.profile().timezone.as_deref(),
+            ));
+        // The AFK line: how long this terminal's keyboard has been quiet is
+        // an `App` fact, mirrored into chat the same way the timezone is,
+        // because chat is what knows which room is on screen to hang it on.
+        changed |= self.chat.sync_afk_line(self.last_input_at.elapsed());
         let translate_to = self.profile_state.profile().translate_to;
         let auto_translate = self.profile_state.profile().auto_translate;
         changed |= self
@@ -633,6 +642,22 @@ impl App {
                 if self.name_flair != name_flair {
                     self.name_flair = name_flair;
                     self.chat_ctx_epoch += 1;
+                }
+            }
+            // The pot resolves on the same edge, and for the same reason:
+            // the panel reads owned values, and only a change the viewer can
+            // actually see (a new size, a minute off the countdown) marks the
+            // frame dirty.
+            if let Some(rx) = &mut self.pot_snapshot_rx {
+                let snapshot = rx.borrow_and_update().clone();
+                let pot_view = crate::app::pot::state::PotView::resolve(
+                    &snapshot,
+                    self.user_id,
+                    chrono::Utc::now(),
+                );
+                if self.pot_view != pot_view {
+                    self.pot_view = pot_view;
+                    changed = true;
                 }
             }
             // Peer countdowns resolve on the same edge, and only the minute
