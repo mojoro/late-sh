@@ -3,12 +3,64 @@
 //! at UTC midnight, so abandoned puzzles fall out of the cycle on their own.
 //! Real-time score games (Lateris, Snake, Traffic, NES) never join.
 
+use chrono::{NaiveDate, Utc};
+use late_core::models::leaderboard::{DailyCompletionStatus, DailyPuzzle};
+
 use crate::app::common::primitives::Screen;
 use crate::app::state::{
     App, GAME_SELECTION_LE_WORD, GAME_SELECTION_MINESWEEPER, GAME_SELECTION_NONOGRAMS,
     GAME_SELECTION_RUBIKS_CUBE, GAME_SELECTION_SLIDING_PUZZLE, GAME_SELECTION_SOLITAIRE,
     GAME_SELECTION_SUDOKU,
 };
+
+/// The dailies this session banked today, kept beside the leaderboard
+/// snapshot so the lobby card turns green the moment a win lands instead of
+/// on the next five-minute refresh (`LeaderboardService::REFRESH_INTERVAL`).
+/// It is fed from the session's own `GameWon` Activity events, which every
+/// daily service publishes only after the win row commits, so it never shows
+/// a win the database does not have. Wins stamped on any day but today are
+/// ignored: a board finished across UTC midnight belongs to yesterday's card.
+pub(crate) struct SessionDailyWins {
+    date: NaiveDate,
+    status: DailyCompletionStatus,
+}
+
+impl SessionDailyWins {
+    pub(crate) fn new() -> Self {
+        Self {
+            date: Utc::now().date_naive(),
+            status: DailyCompletionStatus::default(),
+        }
+    }
+
+    /// Record a win of `game` at `difficulty_key` stamped `won_on`. Returns
+    /// true when today's marks changed.
+    pub(crate) fn note_win(
+        &mut self,
+        won_on: NaiveDate,
+        game: DailyPuzzle,
+        difficulty_key: String,
+    ) -> bool {
+        let today = Utc::now().date_naive();
+        if won_on != today {
+            return false;
+        }
+        if self.date != today {
+            self.date = today;
+            self.status = DailyCompletionStatus::default();
+        }
+        if self.status.completed_difficulty(game, &difficulty_key) {
+            return false;
+        }
+        self.status.mark_completed(game, difficulty_key);
+        true
+    }
+
+    /// Today's session-banked wins, or `None` once the UTC date has moved on.
+    pub(crate) fn today(&self) -> Option<&DailyCompletionStatus> {
+        (self.date == Utc::now().date_naive()).then_some(&self.status)
+    }
+}
 
 /// One cycle-eligible Arcade daily puzzle. Roster order mirrors the Arcade
 /// lobby order (`LOBBY_GAME_ORDER` in `arcade/input.rs`).

@@ -843,9 +843,28 @@ impl App {
                         self.chat
                             .note_friend_went_live(user_id, &event.username, title.as_deref())
                     }
+                    // The session's own daily win: paint the Arcade card now
+                    // rather than on the next leaderboard pass. Score games
+                    // and other players' wins fall through.
+                    ActivityKind::GameWon {
+                        game,
+                        detail: Some(difficulty),
+                        ..
+                    } if user_id == self.user_id => {
+                        if let Some(puzzle) =
+                            late_core::models::leaderboard::DailyPuzzle::from_key(game.key())
+                        {
+                            changed |= self.session_daily_wins.note_win(
+                                event.occurred_at.date_naive(),
+                                puzzle,
+                                difficulty.clone(),
+                            );
+                        }
+                        None
+                    }
                     // Everything else on the global feed is somebody else's
-                    // business: this subscription only exists for the two
-                    // friend edges above.
+                    // business: this subscription only exists for the friend
+                    // edges above and the session's own daily wins.
                     _ => None,
                 };
                 if let Some(b) = banner {

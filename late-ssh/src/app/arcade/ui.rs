@@ -277,6 +277,8 @@ pub struct ArcadeHubView<'a> {
     pub solitaire_state: &'a super::solitaire::state::State,
     pub minesweeper_state: &'a super::minesweeper::state::State,
     pub daily_completion: Option<&'a DailyCompletionStatus>,
+    /// Dailies this session banked today, ahead of the snapshot above.
+    pub session_daily_completion: Option<&'a DailyCompletionStatus>,
     pub quest_state: &'a crate::app::hub::dailies::state::QuestState,
 }
 
@@ -501,7 +503,12 @@ fn draw_game_list(frame: &mut Frame, area: Rect, view: &ArcadeHubView<'_>) {
             Style::default().fg(theme::TEXT_MUTED())
         };
         let status = if available {
-            daily_reward_status_spans(view.daily_completion, game, tiers)
+            daily_reward_status_spans(
+                view.daily_completion,
+                view.session_daily_completion,
+                game,
+                tiers,
+            )
         } else {
             vec![Span::styled(
                 "Coming Soon",
@@ -541,6 +548,7 @@ fn draw_game_list(frame: &mut Frame, area: Rect, view: &ArcadeHubView<'_>) {
                     description_style: Style::default().fg(theme::TEXT_DIM()),
                     status: daily_reward_status_spans(
                         view.daily_completion,
+                        view.session_daily_completion,
                         DailyPuzzle::RubiksCube,
                         &[("daily", super::rubiks_cube::state::DAILY_WIN_REWARD_CHIPS)],
                     ),
@@ -562,6 +570,7 @@ fn draw_game_list(frame: &mut Frame, area: Rect, view: &ArcadeHubView<'_>) {
                     description_style: Style::default().fg(theme::TEXT_DIM()),
                     status: daily_reward_status_spans(
                         view.daily_completion,
+                        view.session_daily_completion,
                         DailyPuzzle::SlidingPuzzle,
                         TIERED_REWARDS,
                     ),
@@ -607,8 +616,12 @@ fn push_game_section(lines: &mut Vec<Line<'static>>, title: &str) {
     )));
 }
 
+/// One `✓chips`/`✗chips` span per tier. A tier is done when either the
+/// leaderboard snapshot or this session's own wins (`SessionDailyWins`) say
+/// so; the snapshot catches up within a refresh, the session mark is instant.
 fn daily_reward_status_spans(
     status: Option<&DailyCompletionStatus>,
+    session_status: Option<&DailyCompletionStatus>,
     game: DailyPuzzle,
     tiers: &[(&str, i64)],
 ) -> Vec<Span<'static>> {
@@ -617,9 +630,10 @@ fn daily_reward_status_spans(
         if i > 0 {
             spans.push(Span::raw(" "));
         }
-        let done = status
-            .map(|s| s.completed_difficulty(game, difficulty_key))
-            .unwrap_or(false);
+        let done = [status, session_status]
+            .into_iter()
+            .flatten()
+            .any(|s| s.completed_difficulty(game, difficulty_key));
         let (glyph, style) = if done {
             ("✓", Style::default().fg(theme::SUCCESS()))
         } else {

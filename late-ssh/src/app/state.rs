@@ -642,6 +642,9 @@ pub struct App {
     /// Leaderboard
     pub(super) leaderboard_rx: Option<watch::Receiver<Arc<LeaderboardData>>>,
     pub(crate) leaderboard: Arc<LeaderboardData>,
+    /// Dailies banked in this session today; painted over `leaderboard`'s
+    /// per-user daily statuses so the Arcade card does not wait a refresh.
+    pub(crate) session_daily_wins: crate::app::arcade::workspace::SessionDailyWins,
 
     /// Bonsai
     pub(crate) bonsai_state: crate::app::bonsai::state::BonsaiState,
@@ -1493,6 +1496,7 @@ impl App {
                 .map(|rx| rx.borrow().clone())
                 .unwrap_or_default(),
             leaderboard_rx: config.leaderboard_rx,
+            session_daily_wins: crate::app::arcade::workspace::SessionDailyWins::new(),
             bonsai_state,
             bonsai_care_state,
             bonsai_v2_state,

@@ -232,7 +232,7 @@ impl DailyCompletionStatus {
             .contains(&(game, difficulty_key.to_string()))
     }
 
-    fn mark_completed(&mut self, game: DailyPuzzle, difficulty_key: String) {
+    pub fn mark_completed(&mut self, game: DailyPuzzle, difficulty_key: String) {
         self.completed_games.insert(game);
         self.completed_difficulties.insert((game, difficulty_key));
     }
@@ -828,6 +828,12 @@ async fn fetch_arcade_champions(client: &Client, limit: i64) -> Result<Vec<Ranke
 /// never double-count. Riding the insert's own statement is what keeps the
 /// rollup drift-free and lets the all-time boards read one row per player
 /// instead of counting the full win history.
+///
+/// The outer statement never references the bump CTE. That is deliberate and
+/// Postgres-specific: data-modifying statements in `WITH` run exactly once
+/// whether or not the main query reads them, so `SELECT * FROM win` is
+/// enough to fire the rollup. On any engine without that rule the totals
+/// would silently stop moving.
 pub fn bump_daily_win_total_sql(puzzle: DailyPuzzle) -> String {
     format!(
         "INSERT INTO daily_win_totals (game, user_id, wins)
